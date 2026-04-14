@@ -1,0 +1,31 @@
+// Example schema for @nestarc/data-subject.
+// Consumers copy the DataSubjectRequest model into their own schema.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model DataSubjectRequest {
+  id            String   @id @default(cuid())
+  tenantId      String
+  subjectId     String
+  type          String
+  state         String
+  createdAt     DateTime @default(now())
+  dueAt         DateTime
+  completedAt   DateTime?
+  failedAt      DateTime?
+  failureReason String?
+  artifactHash  String?
+  artifactUrl   String?
+  stats         Json?
+  requestedBy   String?
+
+  @@index([tenantId, subjectId])
+  @@index([state, dueAt])
+}
