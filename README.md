@@ -325,6 +325,20 @@ npm test
 npm run build
 ```
 
+## CI and Release
+
+GitHub Actions is configured with two workflows:
+
+- `CI`: runs `npm ci`, `npm run lint`, `npm test -- --runInBand`, and `npm run build` on pushes, pull requests, and manual runs
+- `Release`: runs the same validation suite and then publishes to npm when a GitHub Release is published
+
+Release expectations:
+
+- configure repository secret `NPM_TOKEN`
+- publish a GitHub Release from a tag that matches `v<package.json version>`
+- prerelease versions such as `0.1.0-alpha.0` publish with npm dist-tag `next`
+- stable versions publish with npm dist-tag `latest`
+
 ## Related Docs
 
 - [docs/prd.md](docs/prd.md)
