@@ -1,34 +1,55 @@
 # @nestarc/data-subject
 
-DPA-ready GDPR/CCPA toolkit for NestJS + Prisma. Entity registry, export/erase lifecycle, legal retention, outbox fan-out.
+`@nestarc/data-subject` is a small NestJS-oriented toolkit for handling data-subject export and erasure requests against subject-scoped data.
 
-## What this library is NOT
+Today the package ships:
 
-This library rejects three common compliance mistakes:
+- a programmatic entity registry
+- a `DataSubjectService` for `export`, `erase`, and request lookup
+- a `DataSubjectModule.forRoot(...)` integration for NestJS
+- a lightweight Prisma adapter built on `findMany`, `deleteMany`, and `updateMany`
+- in-memory request and artifact stores for tests and local development
+- typed policy validation and typed runtime errors
 
-- "Hashing userId satisfies GDPR erasure" because pseudonymized data is still personal data
-- "Soft delete (`deletedAt`) equals GDPR deletion" because the original data is still recoverable
-- "Anonymization and pseudonymization are the same" because they are not
+## Current Scope
 
-The `pseudonymize: 'hmac'` option exists as a defense-in-depth security measure, not as a substitute for erasure. See [`docs/compliance.md`](docs/compliance.md) for details.
+Package version: `0.1.0-alpha.0`
 
-## Install
+This repository currently focuses on the execution core. It does **not** currently ship:
+
+- decorators or automatic entity discovery
+- a CLI or schema linter
+- persistent request storage adapters
+- persistent artifact storage adapters beyond the in-memory implementation
+- schema-aware Prisma field deletion beyond `null` assignment
+
+If you need database-specific behavior, you can plug in your own `EntityExecutor`, `RequestStorage`, or `ArtifactStorage`.
+
+## Installation
 
 ```bash
 npm install @nestarc/data-subject
 ```
 
-## Quickstart
+Peer dependencies used by this package:
 
-```typescript
+- `@nestjs/common`
+- `@nestjs/core`
+- `reflect-metadata`
+- `rxjs`
+- `@prisma/client` if you use `fromPrisma(...)`
+
+## Quick Start
+
+```ts
 import { Module } from '@nestjs/common';
+import { PrismaClient } from '@prisma/client';
 import {
   DataSubjectModule,
   InMemoryArtifactStorage,
   InMemoryRequestStorage,
   fromPrisma,
 } from '@nestarc/data-subject';
-import { PrismaClient } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
@@ -44,7 +65,11 @@ const prisma = new PrismaClient();
           policy: {
             entityName: 'User',
             subjectField: 'userId',
-            fields: { email: 'delete', name: 'delete' },
+            rowLevel: 'delete-row',
+            fields: {
+              email: 'delete',
+              name: 'delete',
+            },
           },
           executor: fromPrisma({
             delegate: prisma.user,
@@ -66,6 +91,10 @@ const prisma = new PrismaClient();
                 strategy: 'retain',
                 legalBasis: 'tax:KR-basic-law-sec85',
               },
+              customerEmail: {
+                strategy: 'anonymize',
+                replacement: '[REDACTED]',
+              },
             },
           },
           executor: fromPrisma({
@@ -76,7 +105,10 @@ const prisma = new PrismaClient();
         },
       ],
       publishOutbox: async (type, payload) => {
-        /* hand off to @nestarc/outbox */
+        // forward to your outbox publisher
+      },
+      publishAudit: async (event, data) => {
+        // optional hook
       },
     }),
   ],
@@ -84,36 +116,221 @@ const prisma = new PrismaClient();
 export class AppModule {}
 ```
 
-### Process a request
+Usage:
 
-```typescript
+```ts
 const exportRequest = await dataSubject.export('user_123', 'tenant_abc');
-// exportRequest.artifactUrl, exportRequest.artifactHash
-
 const eraseRequest = await dataSubject.erase('user_123', 'tenant_abc');
-// eraseRequest.stats.retained holds rows kept under legal basis
+
+const sameRequest = await dataSubject.getRequest(exportRequest.id);
+const tenantRequests = await dataSubject.listByTenant('tenant_abc');
+const overdue = await dataSubject.listOverdue();
 ```
 
-## Transactional Guarantees
+## Policy Model
 
-`erase()` is only fully rollbackable when your executors, request storage, and outbox publisher all participate in the same transaction boundary.
+Policies are registered per entity and compiled before execution.
 
-By default, the library does **not** guarantee automatic rollback after a late failure such as verification or downstream publishing. To tighten this, pass `runInTransaction` and bind it to your application's transaction mechanism.
+### `delete`
 
-```typescript
-DataSubjectModule.forRoot({
+```ts
+fields: {
+  email: 'delete',
+}
+```
+
+- shorthand `'delete'` is normalized to `{ strategy: 'delete' }`
+- entity `rowLevel` defaults to `'delete-fields'`
+- with the default Prisma adapter:
+  - `'delete-row'` calls `deleteMany`
+  - `'delete-fields'` calls `updateMany` and writes `null` into the configured delete fields
+
+### `anonymize`
+
+```ts
+fields: {
+  email: { strategy: 'anonymize', replacement: '[REDACTED]' },
+}
+```
+
+- replacements must be static
+- function replacements are rejected during policy compilation
+
+### `retain`
+
+```ts
+fields: {
+  amount: {
+    strategy: 'retain',
+    legalBasis: 'tax:KR-basic-law-sec85',
+    until: '+7y',
+  },
+}
+```
+
+- `legalBasis` is required
+- `strictLegalBasis: true` enables `scheme:reference` validation
+- `pseudonymize` is part of the type model, but this package does not perform pseudonymization by itself
+
+### Mixed Strategies
+
+When an entity mixes `delete`, `anonymize`, and `retain`, execution is intentionally conservative:
+
+- `retain` fields are preserved
+- delete fields are downgraded to field-level updates instead of row deletion
+- mixed entities are reported as `strategy: 'mixed'` in erase stats
+- retained fields are recorded in `stats.retained`
+
+This prevents `retain` fields from being dropped just because some other fields on the same row are deletable.
+
+## Export Behavior
+
+`DataSubjectService.export(subjectId, tenantId)` does the following:
+
+1. creates a request record
+2. reads matching rows from every registered entity
+3. writes one JSON file per entity into a ZIP archive
+4. stores the ZIP through `ArtifactStorage.put(...)`
+5. records:
+   - `artifactHash` as a SHA-256 digest of the ZIP bytes
+   - `artifactUrl` returned by the artifact storage
+   - `stats.entities[]` with `strategy: 'export'`
+
+Current export artifact shape:
+
+- key: `<requestId>.zip`
+- contents: `<EntityName>.json` files
+
+## Erase Behavior
+
+`DataSubjectService.erase(subjectId, tenantId)` does the following:
+
+1. creates a request record
+2. publishes `data_subject.erasure_requested`
+3. executes each registered entity according to its compiled policy
+4. records:
+   - `stats.entities[]`
+   - `stats.retained[]`
+   - `stats.verificationResidual[]`
+   - `artifactHash` as a SHA-256 digest of the erase report JSON
+
+Important details:
+
+- erase uses `ArtifactStorage` for exports, but **not** for erase reports
+- erase verification currently only fails on residual rows after `delete-row`
+- field-level delete and anonymize operations keep rows in place by design
+
+## NestJS Integration
+
+`DataSubjectModule.forRoot(...)` accepts:
+
+- `requestStorage`
+- `artifactStorage`
+- `slaDays`
+- `strictLegalBasis`
+- `entities`
+- `publishOutbox`
+- `publishAudit`
+- `runInTransaction`
+
+The module exports:
+
+- `DataSubjectService`
+- `DATA_SUBJECT_REGISTRY`
+
+## Public API
+
+The package currently exports:
+
+- `DataSubjectService`
+- `DataSubjectModule`
+- `Registry`
+- `compilePolicy`
+- `validateLegalBasis`
+- `fromPrisma`
+- `InMemoryRequestStorage`
+- `InMemoryArtifactStorage`
+- all public types from `src/types.ts`
+- typed errors from `src/errors.ts`
+
+## Events and Hooks
+
+### Outbox Hook
+
+If `publishOutbox` is provided, the built-in service emits:
+
+- `data_subject.request_created`
+- `data_subject.erasure_requested`
+- `data_subject.request_completed`
+- `data_subject.request_failed`
+
+`request_completed` and `request_failed` are emitted for both export and erase requests. `erasure_requested` is erase-only.
+
+### Audit Hook
+
+If `publishAudit` is provided, the built-in service currently emits:
+
+- `data_subject.request_created`
+
+No additional audit lifecycle events are emitted by the current implementation.
+
+## Typed Errors
+
+The package exposes `DataSubjectError` with stable error codes.
+
+Currently used codes include:
+
+- `dsr_invalid_policy`
+- `dsr_anonymize_dynamic_replacement`
+- `dsr_verification_failed`
+- `dsr_entity_already_registered`
+- `dsr_request_conflict`
+- `dsr_request_not_found`
+
+Some additional codes exist in the public enum for future or adapter-specific use.
+
+## Transaction Boundaries
+
+`runInTransaction` is an integration hook, not an automatic rollback guarantee.
+
+```ts
+new DataSubjectService({
   // ...
-  runInTransaction: async (work) => prisma.$transaction(async () => work()),
+  runInTransaction: async (work) => myUnitOfWork.run(work),
 });
 ```
 
-This hook is an integration point, not magic. If your executors or storage adapters do not actually use the same transactional resource, rollback is still best-effort.
+Use it when your erase flow can run inside a real unit-of-work that also covers:
 
-## Docs
+- the entity executors
+- request storage writes
+- outbox publishing
 
-- [`docs/prd.md`](docs/prd.md) Product requirements
-- [`docs/spec.md`](docs/spec.md) Technical spec
-- [`docs/compliance.md`](docs/compliance.md) DPA Q&A and legal basis templates
+If those components do not participate in the same transaction boundary, rollback remains best-effort.
+
+## Practical Limitations
+
+The current implementation is intentionally small. A few things are important to know up front:
+
+- `fromPrisma(...)` only depends on `findMany`, `deleteMany`, and `updateMany`
+- default Prisma field deletion writes `null`; it does not inspect schema nullability
+- request states include `validating`, but the built-in service currently transitions through `created -> processing -> completed|failed`
+- there is no built-in subject existence check before export or erase
+- only in-memory request and artifact adapters are included in this repository
+
+## Development
+
+```bash
+npm test
+npm run build
+```
+
+## Related Docs
+
+- [docs/prd.md](docs/prd.md)
+- [docs/spec.md](docs/spec.md)
+- [docs/compliance.md](docs/compliance.md)
+- [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 
