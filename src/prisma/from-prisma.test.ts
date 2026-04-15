@@ -76,10 +76,33 @@ describe('fromPrisma', () => {
       subjectField: 'userId',
     });
 
-    const count = await exec.erase('s1', 't1', 'delete-row');
+    const count = await exec.erase('s1', 't1', {
+      rowLevel: 'delete-row',
+      deleteFields: ['email'],
+    });
 
     expect(count).toBe(1);
     expect(mock.state.rows.length).toBe(0);
+  });
+
+  it('erase nulls delete-fields when row deletion is disabled', async () => {
+    const mock = mockDelegate();
+    const exec = fromPrisma({
+      delegate: mock.delegate,
+      subjectField: 'userId',
+    });
+
+    const count = await exec.erase('s1', 't1', {
+      rowLevel: 'delete-fields',
+      deleteFields: ['email'],
+    });
+
+    expect(count).toBe(1);
+    expect(mock.state.rows).toEqual([{ id: 'u1', userId: 's1', email: null }]);
+    expect(mock.delegate.updateMany).toHaveBeenCalledWith({
+      where: { userId: 's1' },
+      data: { email: null },
+    });
   });
 
   it('anonymize updates by where clause with replacements', async () => {

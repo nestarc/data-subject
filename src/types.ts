@@ -1,4 +1,6 @@
 export type Strategy = 'delete' | 'anonymize' | 'retain';
+export type RequestEntityStrategy = Strategy | 'mixed' | 'export';
+export type RowLevel = 'delete-row' | 'delete-fields';
 
 export type PolicyEntry =
   | 'delete'
@@ -14,13 +16,18 @@ export type PolicyEntry =
 export interface EntityPolicy {
   entityName: string;
   subjectField: string;
-  rowLevel?: 'delete-row' | 'delete-fields';
+  rowLevel: RowLevel;
   fields: Record<string, PolicyEntry>;
+}
+
+export interface ErasePlan {
+  rowLevel: RowLevel;
+  deleteFields: string[];
 }
 
 export interface EntityExecutor {
   select(subjectId: string, tenantId: string): Promise<Record<string, unknown>[]>;
-  erase(subjectId: string, tenantId: string, rowLevel: 'delete-row' | 'delete-fields'): Promise<number>;
+  erase(subjectId: string, tenantId: string, plan: ErasePlan): Promise<number>;
   anonymize(subjectId: string, tenantId: string, replacements: Record<string, unknown>): Promise<number>;
 }
 
@@ -53,7 +60,7 @@ export interface RequestStats {
   entities: Array<{
     entityName: string;
     affected: number;
-    strategy: Strategy | 'mixed';
+    strategy: RequestEntityStrategy;
   }>;
   retained?: Array<{ entityName: string; field: string; legalBasis: string; count: number }>;
   verificationResidual?: Array<{ entityName: string; count: number }>;

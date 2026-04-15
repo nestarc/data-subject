@@ -1,3 +1,4 @@
+import { DataSubjectErrorCode } from '../../src/errors';
 import type { RequestStorage } from '../../src/storage/request-storage.interface';
 import type { DataSubjectRequest } from '../../src/types';
 
@@ -90,6 +91,22 @@ export function requestStorageContract(
       );
 
       expect(overdue.map((request) => request.id)).toEqual(['a']);
+    });
+
+    it('insert rejects duplicate ids with a typed error', async () => {
+      await storage.insert(fixture());
+
+      await expect(storage.insert(fixture())).rejects.toMatchObject({
+        code: DataSubjectErrorCode.RequestConflict,
+      });
+    });
+
+    it('update rejects missing requests with a typed error', async () => {
+      await expect(
+        storage.update('missing', { state: 'failed' }),
+      ).rejects.toMatchObject({
+        code: DataSubjectErrorCode.RequestNotFound,
+      });
     });
   });
 }

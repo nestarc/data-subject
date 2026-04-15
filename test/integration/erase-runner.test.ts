@@ -1,7 +1,7 @@
 import { DataSubjectError } from '../../src/errors';
 import { EraseRunner } from '../../src/erase-runner';
 import { Registry } from '../../src/registry';
-import type { EntityExecutor } from '../../src/types';
+import type { EntityExecutor, ErasePlan } from '../../src/types';
 
 function makeExec(initial: Record<string, unknown>[]): {
   executor: EntityExecutor;
@@ -13,9 +13,20 @@ function makeExec(initial: Record<string, unknown>[]): {
     state,
     executor: {
       select: async () => state.rows.map((row) => ({ ...row })),
-      erase: async () => {
+      erase: async (_subjectId, _tenantId, plan: ErasePlan) => {
         const count = state.rows.length;
-        state.rows = [];
+        if (plan.rowLevel === 'delete-row') {
+          state.rows = [];
+          return count;
+        }
+
+        state.rows = state.rows.map((row) => {
+          const next = { ...row };
+          for (const field of plan.deleteFields) {
+            next[field] = null;
+          }
+          return next;
+        });
         return count;
       },
       anonymize: async (_subjectId, _tenantId, replacements) => {
@@ -39,6 +50,7 @@ describe('EraseRunner', () => {
       policy: {
         entityName: 'User',
         subjectField: 'userId',
+        rowLevel: 'delete-row',
         fields: { email: 'delete' },
       },
       executor: user.executor,
@@ -48,6 +60,29 @@ describe('EraseRunner', () => {
     const result = await runner.run('subject_1', 'tenant_1');
 
     expect(user.state.rows.length).toBe(0);
+    expect(result.stats.entities).toEqual([
+      { entityName: 'User', affected: 1, strategy: 'delete' },
+    ]);
+    expect(result.stats.verificationResidual).toEqual([]);
+  });
+
+  it('defaults delete strategy to field deletion without failing verification', async () => {
+    const registry = new Registry();
+    const user = makeExec([{ id: 'u1', email: 'a@b.com' }]);
+
+    registry.register({
+      policy: {
+        entityName: 'User',
+        subjectField: 'userId',
+        fields: { email: 'delete' },
+      },
+      executor: user.executor,
+    });
+
+    const runner = new EraseRunner(registry);
+    const result = await runner.run('subject_1', 'tenant_1');
+
+    expect(user.state.rows).toEqual([{ id: 'u1', email: null }]);
     expect(result.stats.entities).toEqual([
       { entityName: 'User', affected: 1, strategy: 'delete' },
     ]);
@@ -108,6 +143,43 @@ describe('EraseRunner', () => {
     ]);
   });
 
+  it('downgrades mixed delete and retain rows to field updates', async () => {
+    const registry = new Registry();
+    const user = makeExec([{ id: 'u1', email: 'a@b.com', amount: 100 }]);
+
+    registry.register({
+      policy: {
+        entityName: 'Invoice',
+        subjectField: 'customerId',
+        rowLevel: 'delete-row',
+        fields: {
+          email: 'delete',
+          amount: {
+            strategy: 'retain',
+            legalBasis: 'tax:KR-basic-law-sec85',
+          },
+        },
+      },
+      executor: user.executor,
+    });
+
+    const runner = new EraseRunner(registry);
+    const result = await runner.run('subject_1', 'tenant_1');
+
+    expect(user.state.rows).toEqual([{ id: 'u1', email: null, amount: 100 }]);
+    expect(result.stats.entities).toEqual([
+      { entityName: 'Invoice', affected: 1, strategy: 'mixed' },
+    ]);
+    expect(result.stats.retained).toEqual([
+      {
+        entityName: 'Invoice',
+        field: 'amount',
+        legalBasis: 'tax:KR-basic-law-sec85',
+        count: 1,
+      },
+    ]);
+  });
+
   it('fails verification when delete leaves residuals', async () => {
     const registry = new Registry();
     const broken: EntityExecutor = {
@@ -120,6 +192,7 @@ describe('EraseRunner', () => {
       policy: {
         entityName: 'User',
         subjectField: 'userId',
+        rowLevel: 'delete-row',
         fields: { email: 'delete' },
       },
       executor: broken,

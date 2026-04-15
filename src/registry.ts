@@ -1,3 +1,4 @@
+import { DataSubjectError, DataSubjectErrorCode } from './errors';
 import { compilePolicy, type CompileOptions, type PolicySpec } from './policy-compiler';
 import type { EntityExecutor, RegisteredEntity } from './types';
 
@@ -14,7 +15,10 @@ export class Registry {
   register(input: RegisterInput): void {
     const name = input.policy.entityName;
     if (this.entries.has(name)) {
-      throw new Error(`entity ${name} already registered`);
+      throw new DataSubjectError(
+        DataSubjectErrorCode.EntityAlreadyRegistered,
+        `entity ${name} already registered`,
+      );
     }
 
     const compiled = compilePolicy(input.policy, this.opts);

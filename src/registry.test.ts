@@ -1,3 +1,4 @@
+import { DataSubjectError, DataSubjectErrorCode } from './errors';
 import { Registry } from './registry';
 import type { EntityExecutor } from './types';
 
@@ -36,7 +37,7 @@ describe('Registry', () => {
       executor: noopExec,
     });
 
-    expect(() =>
+    try {
       registry.register({
         policy: {
           entityName: 'User',
@@ -44,8 +45,14 @@ describe('Registry', () => {
           fields: { name: 'delete' },
         },
         executor: noopExec,
-      }),
-    ).toThrow(/already registered/);
+      });
+      throw new Error('expected duplicate registration to throw');
+    } catch (error) {
+      expect(error).toBeInstanceOf(DataSubjectError);
+      expect(error).toMatchObject({
+        code: DataSubjectErrorCode.EntityAlreadyRegistered,
+      });
+    }
   });
 
   it('list returns all registered entries', () => {

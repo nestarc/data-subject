@@ -37,17 +37,25 @@ export function fromPrisma(opts: FromPrismaOptions): EntityExecutor {
     async select(subjectId, tenantId) {
       return delegate.findMany({ where: whereFor(subjectId, tenantId) });
     },
-    async erase(subjectId, tenantId, rowLevel) {
-      if (rowLevel === 'delete-row') {
+    async erase(subjectId, tenantId, plan) {
+      if (plan.rowLevel === 'delete-row') {
         const result = await delegate.deleteMany({
           where: whereFor(subjectId, tenantId),
         });
         return result.count;
       }
 
+      const data = Object.fromEntries(
+        plan.deleteFields.map((field) => [field, null]),
+      );
+
+      if (Object.keys(data).length === 0) {
+        return 0;
+      }
+
       const result = await delegate.updateMany({
         where: whereFor(subjectId, tenantId),
-        data: {},
+        data,
       });
       return result.count;
     },

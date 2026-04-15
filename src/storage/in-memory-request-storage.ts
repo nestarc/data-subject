@@ -1,3 +1,4 @@
+import { DataSubjectError, DataSubjectErrorCode } from '../errors';
 import type { DataSubjectRequest, RequestState } from '../types';
 import type { RequestStorage } from './request-storage.interface';
 
@@ -8,7 +9,10 @@ export class InMemoryRequestStorage implements RequestStorage {
 
   async insert(req: DataSubjectRequest): Promise<void> {
     if (this.store.has(req.id)) {
-      throw new Error(`duplicate id: ${req.id}`);
+      throw new DataSubjectError(
+        DataSubjectErrorCode.RequestConflict,
+        `duplicate id: ${req.id}`,
+      );
     }
 
     this.store.set(req.id, { ...req });
@@ -17,7 +21,10 @@ export class InMemoryRequestStorage implements RequestStorage {
   async update(id: string, patch: Partial<DataSubjectRequest>): Promise<void> {
     const request = this.store.get(id);
     if (!request) {
-      throw new Error(`not found: ${id}`);
+      throw new DataSubjectError(
+        DataSubjectErrorCode.RequestNotFound,
+        `request ${id} not found`,
+      );
     }
 
     Object.assign(request, patch);

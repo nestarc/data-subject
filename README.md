@@ -94,6 +94,21 @@ const eraseRequest = await dataSubject.erase('user_123', 'tenant_abc');
 // eraseRequest.stats.retained holds rows kept under legal basis
 ```
 
+## Transactional Guarantees
+
+`erase()` is only fully rollbackable when your executors, request storage, and outbox publisher all participate in the same transaction boundary.
+
+By default, the library does **not** guarantee automatic rollback after a late failure such as verification or downstream publishing. To tighten this, pass `runInTransaction` and bind it to your application's transaction mechanism.
+
+```typescript
+DataSubjectModule.forRoot({
+  // ...
+  runInTransaction: async (work) => prisma.$transaction(async () => work()),
+});
+```
+
+This hook is an integration point, not magic. If your executors or storage adapters do not actually use the same transactional resource, rollback is still best-effort.
+
 ## Docs
 
 - [`docs/prd.md`](docs/prd.md) Product requirements

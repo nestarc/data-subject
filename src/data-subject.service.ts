@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { EraseRunner } from './erase-runner';
+import { DataSubjectError, DataSubjectErrorCode } from './errors';
 import { ExportRunner } from './export-runner';
 import type { Registry } from './registry';
 import type { ArtifactStorage } from './storage/artifact-storage.interface';
@@ -20,6 +21,7 @@ export interface DataSubjectServiceDeps {
   clock?: () => Date;
   publishOutbox?: (type: string, payload: unknown) => Promise<void>;
   publishAudit?: (event: string, data: Record<string, unknown>) => Promise<void>;
+  runInTransaction?: <T>(work: () => Promise<T>) => Promise<T>;
 }
 
 export class DataSubjectService {
@@ -31,12 +33,16 @@ export class DataSubjectService {
   private readonly publishAudit: NonNullable<
     DataSubjectServiceDeps['publishAudit']
   >;
+  private readonly runInTransaction: NonNullable<
+    DataSubjectServiceDeps['runInTransaction']
+  >;
 
   constructor(private readonly deps: DataSubjectServiceDeps) {
     this.idFactory = deps.idFactory ?? (() => randomUUID());
     this.clock = deps.clock ?? (() => new Date());
     this.publishOutbox = deps.publishOutbox ?? (async () => {});
     this.publishAudit = deps.publishAudit ?? (async () => {});
+    this.runInTransaction = deps.runInTransaction ?? (async (work) => work());
   }
 
   async export(
@@ -61,8 +67,18 @@ export class DataSubjectService {
         artifactUrl: result.artifactUrl,
         stats: result.stats,
       });
+
+      await this.publishOutbox('data_subject.request_completed', {
+        requestId: request.id,
+        state: 'completed',
+        artifactHash: result.artifactHash,
+      });
     } catch (error) {
       await this.markFailed(request.id, error);
+      await this.publishOutbox('data_subject.request_failed', {
+        requestId: request.id,
+        failureReason: messageFromError(error),
+      });
     }
 
     return this.mustLoad(request.id);
@@ -74,38 +90,40 @@ export class DataSubjectService {
   ): Promise<DataSubjectRequest> {
     const request = await this.createRequest('erase', subjectId, tenantId);
 
-    await this.publishOutbox('data_subject.erasure_requested', {
-      requestId: request.id,
-      subjectId,
-      tenantId,
-      requestedAt: this.clock().toISOString(),
-    });
-
     try {
-      await this.setState(request.id, 'processing');
+      await this.runInTransaction(async () => {
+        await this.publishOutbox('data_subject.erasure_requested', {
+          requestId: request.id,
+          subjectId,
+          tenantId,
+          requestedAt: this.clock().toISOString(),
+        });
 
-      const runner = new EraseRunner(this.deps.registry);
-      const result = await runner.run(subjectId, tenantId);
-      const report = JSON.stringify({ requestId: request.id, stats: result.stats });
-      const artifactHash = createHash('sha256').update(report).digest('hex');
+        await this.setState(request.id, 'processing');
 
-      await this.deps.requestStorage.update(request.id, {
-        state: 'completed',
-        completedAt: this.clock(),
-        stats: result.stats,
-        artifactHash,
-      });
+        const runner = new EraseRunner(this.deps.registry);
+        const result = await runner.run(subjectId, tenantId);
+        const report = JSON.stringify({ requestId: request.id, stats: result.stats });
+        const artifactHash = createHash('sha256').update(report).digest('hex');
 
-      await this.publishOutbox('data_subject.request_completed', {
-        requestId: request.id,
-        state: 'completed',
-        artifactHash,
+        await this.deps.requestStorage.update(request.id, {
+          state: 'completed',
+          completedAt: this.clock(),
+          stats: result.stats,
+          artifactHash,
+        });
+
+        await this.publishOutbox('data_subject.request_completed', {
+          requestId: request.id,
+          state: 'completed',
+          artifactHash,
+        });
       });
     } catch (error) {
       await this.markFailed(request.id, error);
       await this.publishOutbox('data_subject.request_failed', {
         requestId: request.id,
-        failureReason: (error as Error).message,
+        failureReason: messageFromError(error),
       });
     }
 
@@ -175,16 +193,35 @@ export class DataSubjectService {
     await this.deps.requestStorage.update(id, {
       state: 'failed',
       failedAt: this.clock(),
-      failureReason: (error as Error).message,
+      failureReason: messageFromError(error),
     });
   }
 
   private async mustLoad(id: string): Promise<DataSubjectRequest> {
     const request = await this.deps.requestStorage.findById(id);
     if (!request) {
-      throw new Error(`request ${id} not found`);
+      throw new DataSubjectError(
+        DataSubjectErrorCode.RequestNotFound,
+        `request ${id} not found`,
+      );
     }
 
     return request;
+  }
+}
+
+function messageFromError(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  if (typeof error === 'string') {
+    return error;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
   }
 }

@@ -1,6 +1,11 @@
 import { DataSubjectError, DataSubjectErrorCode } from './errors';
 import type { Registry } from './registry';
-import type { EntityPolicy, PolicyEntry, RequestStats, Strategy } from './types';
+import type {
+  EntityPolicy,
+  PolicyEntry,
+  RequestStats,
+  Strategy,
+} from './types';
 
 export interface EraseResult {
   stats: RequestStats;
@@ -23,13 +28,16 @@ export class EraseRunner {
         affected = await entry.executor.erase(
           subjectId,
           tenantId,
-          entry.policy.rowLevel ?? 'delete-fields',
+          {
+            rowLevel: entry.policy.rowLevel,
+            deleteFields: outcome.deleteFields,
+          },
         );
       } else if (outcome.rowStrategy === 'anonymize') {
         affected = await entry.executor.anonymize(
           subjectId,
           tenantId,
-          outcome.anonymizeMap,
+          outcome.updateMap,
         );
       } else {
         const rows = await entry.executor.select(subjectId, tenantId);
@@ -47,7 +55,11 @@ export class EraseRunner {
         });
       }
 
-      if (outcome.rowStrategy === 'delete' && rowsAfter.length > 0) {
+      if (
+        outcome.rowStrategy === 'delete' &&
+        entry.policy.rowLevel === 'delete-row' &&
+        rowsAfter.length > 0
+      ) {
         verificationResidual.push({
           entityName: entry.policy.entityName,
           count: rowsAfter.length,
@@ -76,13 +88,15 @@ export class EraseRunner {
 
 interface Outcome {
   rowStrategy: Strategy;
-  summaryStrategy: Strategy | 'mixed';
-  anonymizeMap: Record<string, unknown>;
+  summaryStrategy: RequestStats['entities'][number]['strategy'];
+  deleteFields: string[];
+  updateMap: Record<string, unknown>;
   retained: Array<{ field: string; legalBasis: string }>;
 }
 
 function classify(policy: EntityPolicy): Outcome {
-  const anonymizeMap: Record<string, unknown> = {};
+  const updateMap: Record<string, unknown> = {};
+  const deleteFields: string[] = [];
   const retained: Outcome['retained'] = [];
   const strategies = new Set<Strategy>();
 
@@ -91,33 +105,63 @@ function classify(policy: EntityPolicy): Outcome {
     strategies.add(normalized.strategy);
 
     if (normalized.strategy === 'anonymize') {
-      anonymizeMap[field] = (entry as { replacement: unknown }).replacement;
+      updateMap[field] = normalized.replacement;
+    }
+
+    if (normalized.strategy === 'delete') {
+      deleteFields.push(field);
+      updateMap[field] = null;
     }
 
     if (normalized.strategy === 'retain') {
       retained.push({
         field,
-        legalBasis: (entry as { legalBasis: string }).legalBasis,
+        legalBasis: normalized.legalBasis,
       });
     }
   }
 
-  const rowStrategy: Strategy = strategies.has('delete')
-    ? 'delete'
-    : strategies.has('anonymize')
-      ? 'anonymize'
-      : 'retain';
+  const rowStrategy = chooseRowStrategy(strategies);
 
-  const summaryStrategy: Strategy | 'mixed' =
+  const summaryStrategy: Outcome['summaryStrategy'] =
     strategies.size > 1 ? 'mixed' : rowStrategy;
 
-  return { rowStrategy, summaryStrategy, anonymizeMap, retained };
+  return { rowStrategy, summaryStrategy, deleteFields, updateMap, retained };
 }
 
-function normalize(entry: PolicyEntry): { strategy: Strategy } {
+function chooseRowStrategy(strategies: Set<Strategy>): Strategy {
+  if (strategies.size === 1 && strategies.has('delete')) {
+    return 'delete';
+  }
+
+  if (strategies.size === 1 && strategies.has('retain')) {
+    return 'retain';
+  }
+
+  return 'anonymize';
+}
+
+function normalize(entry: PolicyEntry):
+  | { strategy: 'delete' }
+  | { strategy: 'anonymize'; replacement: unknown }
+  | { strategy: 'retain'; legalBasis: string } {
   if (entry === 'delete') {
     return { strategy: 'delete' };
   }
 
-  return { strategy: entry.strategy };
+  if (entry.strategy === 'anonymize') {
+    return {
+      strategy: 'anonymize',
+      replacement: entry.replacement,
+    };
+  }
+
+  if (entry.strategy === 'retain') {
+    return {
+      strategy: 'retain',
+      legalBasis: entry.legalBasis,
+    };
+  }
+
+  return { strategy: 'delete' };
 }

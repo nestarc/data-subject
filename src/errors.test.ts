@@ -14,6 +14,18 @@ describe('DataSubjectError', () => {
     expect(err.httpStatus).toBe(500);
   });
 
+  it('request conflict maps to 409', () => {
+    const err = new DataSubjectError(DataSubjectErrorCode.RequestConflict);
+
+    expect(err.httpStatus).toBe(409);
+  });
+
+  it('request not found maps to 404', () => {
+    const err = new DataSubjectError(DataSubjectErrorCode.RequestNotFound);
+
+    expect(err.httpStatus).toBe(404);
+  });
+
   it('preserves an optional reason', () => {
     const err = new DataSubjectError(DataSubjectErrorCode.InvalidPolicy, 'missing legalBasis');
 

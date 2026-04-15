@@ -18,6 +18,7 @@ export interface DataSubjectModuleOptions {
   entities?: RegisterInput[];
   publishOutbox?: DataSubjectServiceDeps['publishOutbox'];
   publishAudit?: DataSubjectServiceDeps['publishAudit'];
+  runInTransaction?: DataSubjectServiceDeps['runInTransaction'];
 }
 
 @Module({})
@@ -48,6 +49,7 @@ export class DataSubjectModule {
             slaDays: options.slaDays ?? 30,
             publishOutbox: options.publishOutbox,
             publishAudit: options.publishAudit,
+            runInTransaction: options.runInTransaction,
           }),
         inject: [DATA_SUBJECT_REGISTRY],
       },

@@ -44,6 +44,9 @@ describe('ExportRunner', () => {
       'Order',
       'User',
     ]);
+    expect(result.stats.entities.every((entry) => entry.strategy === 'export')).toBe(
+      true,
+    );
 
     const stored = await artifacts.get('dsr_1.zip');
     expect(stored).not.toBeNull();

@@ -4,6 +4,9 @@ export const DataSubjectErrorCode = {
   InvalidPolicy: 'dsr_invalid_policy',
   VerificationFailed: 'dsr_verification_failed',
   AnonymizeDynamicReplacement: 'dsr_anonymize_dynamic_replacement',
+  EntityAlreadyRegistered: 'dsr_entity_already_registered',
+  RequestConflict: 'dsr_request_conflict',
+  RequestNotFound: 'dsr_request_not_found',
 } as const;
 
 export type DataSubjectErrorCode =
@@ -15,6 +18,9 @@ const HTTP_STATUS: Record<DataSubjectErrorCode, number> = {
   dsr_invalid_policy: 500,
   dsr_verification_failed: 500,
   dsr_anonymize_dynamic_replacement: 500,
+  dsr_entity_already_registered: 500,
+  dsr_request_conflict: 409,
+  dsr_request_not_found: 404,
 };
 
 export class DataSubjectError extends Error {

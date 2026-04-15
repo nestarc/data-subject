@@ -32,7 +32,7 @@ export class ExportRunner {
       entities.push({
         entityName: entry.policy.entityName,
         affected: rows.length,
-        strategy: 'delete',
+        strategy: 'export',
       });
     }
 
