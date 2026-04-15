@@ -4,9 +4,9 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project currently tracks the shipped behavior of the repository rather than a long release history.
 
-## [0.1.0-alpha.0] - 2026-04-15
+## [0.1.0] - 2026-04-15
 
-Initial public alpha for the core data-subject workflow.
+Initial public release for the core data-subject workflow.
 
 ### Added
 

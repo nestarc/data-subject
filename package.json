@@ -1,6 +1,6 @@
 {
   "name": "@nestarc/data-subject",
-  "version": "0.1.0-alpha.0",
+  "version": "0.1.0",
   "description": "DPA-ready GDPR/CCPA toolkit for NestJS + Prisma. Entity registry, export/erase lifecycle, legal retention, outbox fan-out.",
   "license": "MIT",
   "author": "nestarc",

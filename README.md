@@ -13,7 +13,7 @@ Today the package ships:
 
 ## Current Scope
 
-Package version: `0.1.0-alpha.0`
+Package version: `0.1.0`
 
 This repository currently focuses on the execution core. It does **not** currently ship:
 
@@ -336,8 +336,8 @@ Release expectations:
 
 - configure repository secret `NPM_TOKEN`
 - publish a GitHub Release from a tag that matches `v<package.json version>`
-- prerelease versions such as `0.1.0-alpha.0` publish with npm dist-tag `next`
-- stable versions publish with npm dist-tag `latest`
+- prerelease versions publish with npm dist-tag `next`
+- stable versions such as `0.1.0` publish with npm dist-tag `latest`
 
 ## Related Docs
 
