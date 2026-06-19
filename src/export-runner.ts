@@ -1,7 +1,6 @@
-import { createHash } from 'node:crypto';
-
 import JSZip from 'jszip';
 
+import { exportArtifactKey, sha256Hex } from './artifacts';
 import type { Registry } from './registry';
 import type { ArtifactStorage } from './storage/artifact-storage.interface';
 import type { RequestStats } from './types';
@@ -37,9 +36,9 @@ export class ExportRunner {
     }
 
     const body = await zip.generateAsync({ type: 'nodebuffer' });
-    const artifactHash = createHash('sha256').update(body).digest('hex');
+    const artifactHash = sha256Hex(body);
     const artifactUrl = await this.artifacts.put(
-      `${requestId}.zip`,
+      exportArtifactKey(tenantId, requestId),
       body,
       'application/zip',
     );

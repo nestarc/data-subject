@@ -8,19 +8,22 @@ Today the package ships:
 - a `DataSubjectService` for `export`, `erase`, and request lookup
 - a `DataSubjectModule.forRoot(...)` integration for NestJS
 - a lightweight Prisma adapter built on `findMany`, `deleteMany`, and `updateMany`
+- a `PrismaRequestStorage` adapter for persistent request records
 - in-memory request and artifact stores for tests and local development
+- erase evidence artifacts with pre/post scan stats and SHA-256 hashes
+- a `data-subject lint` CLI for Prisma schema/policy checks
 - typed policy validation and typed runtime errors
 
 ## Current Scope
 
-Package version: `0.1.0`
+Package version: `0.2.0`
 
-This repository currently focuses on the execution core. It does **not** currently ship:
+This repository focuses on the execution core plus the minimum production trust layer. It does **not** currently ship:
 
 - decorators or automatic entity discovery
-- a CLI or schema linter
-- persistent request storage adapters
 - persistent artifact storage adapters beyond the in-memory implementation
+- direct Stripe, Intercom, analytics, or support-tool connectors
+- an admin or end-user portal
 - schema-aware Prisma field deletion beyond `null` assignment
 
 If you need database-specific behavior, you can plug in your own `EntityExecutor`, `RequestStorage`, or `ArtifactStorage`.
@@ -47,17 +50,20 @@ import { PrismaClient } from '@prisma/client';
 import {
   DataSubjectModule,
   InMemoryArtifactStorage,
-  InMemoryRequestStorage,
+  PrismaRequestStorage,
   fromPrisma,
 } from '@nestarc/data-subject';
 
 const prisma = new PrismaClient();
+const artifactStorage = new InMemoryArtifactStorage(); // local/dev only; use private durable storage in production
 
 @Module({
   imports: [
     DataSubjectModule.forRoot({
-      requestStorage: new InMemoryRequestStorage(),
-      artifactStorage: new InMemoryArtifactStorage(),
+      requestStorage: new PrismaRequestStorage({
+        delegate: prisma.dataSubjectRequest,
+      }),
+      artifactStorage,
       slaDays: 30,
       strictLegalBasis: true,
       entities: [
@@ -115,6 +121,8 @@ const prisma = new PrismaClient();
 })
 export class AppModule {}
 ```
+
+For tests and local development, `InMemoryRequestStorage` and `InMemoryArtifactStorage` are still available. Do not use in-memory storage for production request history or evidence retention.
 
 Usage:
 
@@ -198,7 +206,7 @@ This prevents `retain` fields from being dropped just because some other fields 
 
 Current export artifact shape:
 
-- key: `<requestId>.zip`
+- key: `data-subject/{tenantId}/{requestId}/export.zip`
 - contents: `<EntityName>.json` files
 
 ## Erase Behavior
@@ -206,19 +214,27 @@ Current export artifact shape:
 `DataSubjectService.erase(subjectId, tenantId)` does the following:
 
 1. creates a request record
-2. publishes `data_subject.erasure_requested`
-3. executes each registered entity according to its compiled policy
-4. records:
+2. transitions the request to `processing`
+3. performs a pre-scan for registered entities
+4. publishes `data_subject.erasure_requested`
+5. executes each registered entity according to its compiled policy
+6. performs a post-scan and residual verification
+7. stores an erase evidence JSON artifact through `ArtifactStorage.put(...)`
+8. records:
    - `stats.entities[]`
    - `stats.retained[]`
    - `stats.verificationResidual[]`
-   - `artifactHash` as a SHA-256 digest of the erase report JSON
+   - `stats.preScan[]`
+   - `stats.postScan[]`
+   - `artifactHash` as a SHA-256 digest of the erase evidence artifact
+   - `artifactUrl` returned by the artifact storage
 
 Important details:
 
-- erase uses `ArtifactStorage` for exports, but **not** for erase reports
+- erase evidence artifacts intentionally exclude raw rows and field values
 - erase verification currently only fails on residual rows after `delete-row`
 - field-level delete and anonymize operations keep rows in place by design
+- `subjectId` is not written into the default erase evidence artifact; it remains connected through the request record
 
 ## NestJS Integration
 
@@ -250,8 +266,21 @@ The package currently exports:
 - `fromPrisma`
 - `InMemoryRequestStorage`
 - `InMemoryArtifactStorage`
+- `PrismaRequestStorage`
+- `lintPrismaSchema`
+- `validateRegistry`
 - all public types from `src/types.ts`
 - typed errors from `src/errors.ts`
+
+## Schema Lint
+
+The package includes a small Prisma schema linter:
+
+```bash
+npx @nestarc/data-subject lint --schema prisma/schema.prisma --config data-subject.config.json
+```
+
+The linter checks for PII-like field names, missing policy fields, missing subject fields, missing tenant metadata, invalid policies, and suppressions without reasons. It is a safety net, not a full data discovery tool.
 
 ## Events and Hooks
 
@@ -260,6 +289,7 @@ The package currently exports:
 If `publishOutbox` is provided, the built-in service emits:
 
 - `data_subject.request_created`
+- `data_subject.request_processing` through the audit hook
 - `data_subject.erasure_requested`
 - `data_subject.request_completed`
 - `data_subject.request_failed`
@@ -271,8 +301,9 @@ If `publishOutbox` is provided, the built-in service emits:
 If `publishAudit` is provided, the built-in service currently emits:
 
 - `data_subject.request_created`
-
-No additional audit lifecycle events are emitted by the current implementation.
+- `data_subject.request_processing`
+- `data_subject.request_completed`
+- `data_subject.request_failed`
 
 ## Typed Errors
 
@@ -286,6 +317,9 @@ Currently used codes include:
 - `dsr_entity_already_registered`
 - `dsr_request_conflict`
 - `dsr_request_not_found`
+- `dsr_artifact_write_failed`
+- `dsr_invalid_state_transition`
+- `dsr_evidence_report_invalid`
 
 Some additional codes exist in the public enum for future or adapter-specific use.
 
@@ -316,7 +350,7 @@ The current implementation is intentionally small. A few things are important to
 - default Prisma field deletion writes `null`; it does not inspect schema nullability
 - request states include `validating`, but the built-in service currently transitions through `created -> processing -> completed|failed`
 - there is no built-in subject existence check before export or erase
-- only in-memory request and artifact adapters are included in this repository
+- no production cloud artifact adapter is bundled; use a private `ArtifactStorage` implementation for S3, R2, GCS, or equivalent storage
 
 ## Development
 
@@ -337,12 +371,14 @@ Release expectations:
 - configure repository secret `NPM_TOKEN`
 - publish a GitHub Release from a tag that matches `v<package.json version>`
 - prerelease versions publish with npm dist-tag `next`
-- stable versions such as `0.1.0` publish with npm dist-tag `latest`
+- stable versions such as `0.2.0` publish with npm dist-tag `latest`
 
 ## Related Docs
 
 - [docs/prd.md](docs/prd.md)
 - [docs/spec.md](docs/spec.md)
+- [docs/data-subject-0.2.0-feature-proposal.md](docs/data-subject-0.2.0-feature-proposal.md)
+- [docs/data-subject-0.2.0-spec.md](docs/data-subject-0.2.0-spec.md)
 - [docs/compliance.md](docs/compliance.md)
 - [CHANGELOG.md](CHANGELOG.md)
 

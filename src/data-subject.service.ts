@@ -1,9 +1,12 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
+import { erasureEvidenceArtifactKey, sha256Hex } from './artifacts';
 import { EraseRunner } from './erase-runner';
+import { buildErasureEvidenceArtifact } from './erasure-evidence';
 import { DataSubjectError, DataSubjectErrorCode } from './errors';
 import { ExportRunner } from './export-runner';
 import type { Registry } from './registry';
+import { stableStringify } from './stable-json';
 import type { ArtifactStorage } from './storage/artifact-storage.interface';
 import type { RequestStorage } from './storage/request-storage.interface';
 import type {
@@ -53,6 +56,11 @@ export class DataSubjectService {
 
     try {
       await this.setState(request.id, 'processing');
+      await this.publishAudit('data_subject.request_processing', {
+        requestId: request.id,
+        type: request.type,
+        tenantId: request.tenantId,
+      });
 
       const runner = new ExportRunner(
         this.deps.registry,
@@ -70,14 +78,30 @@ export class DataSubjectService {
 
       await this.publishOutbox('data_subject.request_completed', {
         requestId: request.id,
+        requestType: request.type,
+        tenantId: request.tenantId,
         state: 'completed',
+        artifactHash: result.artifactHash,
+      });
+      await this.publishAudit('data_subject.request_completed', {
+        requestId: request.id,
+        type: request.type,
+        tenantId: request.tenantId,
         artifactHash: result.artifactHash,
       });
     } catch (error) {
       await this.markFailed(request.id, error);
       await this.publishOutbox('data_subject.request_failed', {
         requestId: request.id,
-        failureReason: messageFromError(error),
+        requestType: request.type,
+        tenantId: request.tenantId,
+        failureReason: sanitizeFailureReason(error),
+      });
+      await this.publishAudit('data_subject.request_failed', {
+        requestId: request.id,
+        type: request.type,
+        tenantId: request.tenantId,
+        failureReason: sanitizeFailureReason(error),
       });
     }
 
@@ -92,30 +116,66 @@ export class DataSubjectService {
 
     try {
       await this.runInTransaction(async () => {
-        await this.publishOutbox('data_subject.erasure_requested', {
+        await this.setState(request.id, 'processing');
+        await this.publishAudit('data_subject.request_processing', {
           requestId: request.id,
-          subjectId,
-          tenantId,
-          requestedAt: this.clock().toISOString(),
+          type: request.type,
+          tenantId: request.tenantId,
         });
 
-        await this.setState(request.id, 'processing');
-
         const runner = new EraseRunner(this.deps.registry);
-        const result = await runner.run(subjectId, tenantId);
-        const report = JSON.stringify({ requestId: request.id, stats: result.stats });
-        const artifactHash = createHash('sha256').update(report).digest('hex');
+        const result = await runner.run(subjectId, tenantId, {
+          afterPreScan: async () => {
+            await this.publishOutbox('data_subject.erasure_requested', {
+              requestId: request.id,
+              subjectId,
+              tenantId,
+              requestedAt: this.clock().toISOString(),
+            });
+          },
+        });
+        const artifact = buildErasureEvidenceArtifact({
+          requestId: request.id,
+          tenantId,
+          generatedAt: this.clock(),
+          stats: result.stats,
+          actions: result.actions,
+        });
+        const body = Buffer.from(stableStringify(artifact), 'utf8');
+        const artifactHash = sha256Hex(body);
+        const artifactUrl = await this.deps.artifactStorage.put(
+          erasureEvidenceArtifactKey(tenantId, request.id),
+          body,
+          'application/json',
+        );
+        const stats = {
+          ...result.stats,
+          evidence: {
+            schemaVersion: 'data-subject.evidence.v1' as const,
+            artifactHash,
+            artifactUrl,
+          },
+        };
 
         await this.deps.requestStorage.update(request.id, {
           state: 'completed',
           completedAt: this.clock(),
-          stats: result.stats,
+          stats,
           artifactHash,
+          artifactUrl,
         });
 
         await this.publishOutbox('data_subject.request_completed', {
           requestId: request.id,
+          requestType: request.type,
+          tenantId: request.tenantId,
           state: 'completed',
+          artifactHash,
+        });
+        await this.publishAudit('data_subject.request_completed', {
+          requestId: request.id,
+          type: request.type,
+          tenantId: request.tenantId,
           artifactHash,
         });
       });
@@ -123,7 +183,15 @@ export class DataSubjectService {
       await this.markFailed(request.id, error);
       await this.publishOutbox('data_subject.request_failed', {
         requestId: request.id,
-        failureReason: messageFromError(error),
+        requestType: request.type,
+        tenantId: request.tenantId,
+        failureReason: sanitizeFailureReason(error),
+      });
+      await this.publishAudit('data_subject.request_failed', {
+        requestId: request.id,
+        type: request.type,
+        tenantId: request.tenantId,
+        failureReason: sanitizeFailureReason(error),
       });
     }
 
@@ -172,7 +240,7 @@ export class DataSubjectService {
     await this.deps.requestStorage.insert(request);
     await this.publishOutbox('data_subject.request_created', {
       requestId: request.id,
-      type,
+      requestType: type,
       subjectId,
       tenantId,
     });
@@ -193,7 +261,7 @@ export class DataSubjectService {
     await this.deps.requestStorage.update(id, {
       state: 'failed',
       failedAt: this.clock(),
-      failureReason: messageFromError(error),
+      failureReason: sanitizeFailureReason(error),
     });
   }
 
@@ -208,6 +276,13 @@ export class DataSubjectService {
 
     return request;
   }
+}
+
+function sanitizeFailureReason(error: unknown): string {
+  const message = messageFromError(error)
+    .replace(/\s+/g, ' ')
+    .trim();
+  return message.length > 500 ? `${message.slice(0, 497)}...` : message;
 }
 
 function messageFromError(error: unknown): string {

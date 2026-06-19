@@ -21,9 +21,38 @@ export type { DataSubjectModuleOptions } from './data-subject.module';
 
 export type { RequestStorage } from './storage/request-storage.interface';
 export { InMemoryRequestStorage } from './storage/in-memory-request-storage';
+export { PrismaRequestStorage } from './storage/prisma-request-storage';
+export type {
+  PrismaDataSubjectRequestDelegate,
+  PrismaRequestStorageOptions,
+} from './storage/prisma-request-storage';
 
 export type { ArtifactStorage } from './storage/artifact-storage.interface';
 export { InMemoryArtifactStorage } from './storage/in-memory-artifact-storage';
 
 export { fromPrisma } from './prisma/from-prisma';
 export type { FromPrismaOptions, PrismaDelegate } from './prisma/from-prisma';
+
+export {
+  exportArtifactKey,
+  erasureEvidenceArtifactKey,
+  sha256Hex,
+} from './artifacts';
+export { buildErasureEvidenceArtifact } from './erasure-evidence';
+export { validateRegistry } from './registry-validation';
+export type { RegistryValidationReport } from './registry-validation';
+export {
+  formatLintReport,
+  lintPrismaSchema,
+  parsePrismaSchema,
+  shouldFailLint,
+} from './lint';
+export type {
+  DataSubjectLintCode,
+  DataSubjectLintConfig,
+  DataSubjectLintFinding,
+  DataSubjectLintRegistryEntry,
+  DataSubjectLintReport,
+  DataSubjectLintSeverity,
+  DataSubjectLintSuppression,
+} from './lint';

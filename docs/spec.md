@@ -1,5 +1,7 @@
 # @nestarc/data-subject — v0.1 Technical Spec
 
+Status: Historical v0.1 planning spec. For the current 0.2.0 implementation target, see [data-subject-0.2.0-spec.md](./data-subject-0.2.0-spec.md).
+
 본 문서는 v0.1에서 고정되는 기술 결정을 기록한다. 변경은 RFC 수준의 논의를 거친다.
 
 ## 1. 엔티티 레지스트리

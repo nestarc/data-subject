@@ -7,6 +7,9 @@ export const DataSubjectErrorCode = {
   EntityAlreadyRegistered: 'dsr_entity_already_registered',
   RequestConflict: 'dsr_request_conflict',
   RequestNotFound: 'dsr_request_not_found',
+  ArtifactWriteFailed: 'dsr_artifact_write_failed',
+  InvalidStateTransition: 'dsr_invalid_state_transition',
+  EvidenceReportInvalid: 'dsr_evidence_report_invalid',
 } as const;
 
 export type DataSubjectErrorCode =
@@ -21,6 +24,9 @@ const HTTP_STATUS: Record<DataSubjectErrorCode, number> = {
   dsr_entity_already_registered: 500,
   dsr_request_conflict: 409,
   dsr_request_not_found: 404,
+  dsr_artifact_write_failed: 500,
+  dsr_invalid_state_transition: 500,
+  dsr_evidence_report_invalid: 500,
 };
 
 export class DataSubjectError extends Error {

@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project currently tracks the shipped behavior of the repository rather than a long release history.
 
+## [0.2.0] - 2026-06-19
+
+### Added
+
+- `PrismaRequestStorage` for persistent `DataSubjectRequest` records.
+- Stable artifact key helpers for export ZIPs and erase evidence artifacts.
+- Erase evidence JSON artifacts stored through `ArtifactStorage`.
+- Pre-scan and post-scan erase stats.
+- Full audit lifecycle events for request created, processing, completed, and failed paths.
+- Typed outbox event payload types.
+- `data-subject lint` CLI for Prisma schema/policy checks.
+- `lintPrismaSchema(...)`, `formatLintReport(...)`, `shouldFailLint(...)`, and `parsePrismaSchema(...)`.
+- `validateRegistry(...)` runtime validation helper.
+- `docs/data-subject-0.2.0-feature-proposal.md`.
+- `docs/data-subject-0.2.0-spec.md`.
+
+### Changed
+
+- Package version is now `0.2.0`.
+- Export artifact keys now use `data-subject/{tenantId}/{requestId}/export.zip`.
+- Erase requests now record `artifactUrl` in addition to `artifactHash`.
+- Request completion/failure outbox payloads include request type and tenant id.
+
+### Security
+
+- Erase evidence artifacts exclude raw rows and field values by default.
+- Failure reasons are normalized before request storage, audit, and outbox publication.
+
 ## [0.1.0] - 2026-04-15
 
 Initial public release for the core data-subject workflow.

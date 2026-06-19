@@ -62,6 +62,87 @@ export interface RequestStats {
     affected: number;
     strategy: RequestEntityStrategy;
   }>;
-  retained?: Array<{ entityName: string; field: string; legalBasis: string; count: number }>;
+  retained?: Array<{
+    entityName: string;
+    field: string;
+    legalBasis: string;
+    until?: string;
+    count: number;
+  }>;
   verificationResidual?: Array<{ entityName: string; count: number }>;
+  preScan?: Array<{ entityName: string; count: number }>;
+  postScan?: Array<{ entityName: string; count: number }>;
+  evidence?: {
+    schemaVersion: 'data-subject.evidence.v1';
+    artifactHash: string;
+    artifactUrl: string;
+  };
 }
+
+export interface ErasureEvidenceAction {
+  entityName: string;
+  strategy: Exclude<RequestEntityStrategy, 'export'>;
+  affected: number;
+  rowLevel: RowLevel;
+  deleteFields?: string[];
+  anonymizedFields?: string[];
+  retainedFields?: Array<{
+    field: string;
+    legalBasis: string;
+    until?: string;
+    count: number;
+  }>;
+}
+
+export interface ErasureEvidenceArtifact {
+  schemaVersion: 'data-subject.erasure-evidence.v1';
+  requestId: string;
+  tenantId: string;
+  requestType: 'erase';
+  generatedAt: string;
+  state: 'completed';
+  preScan: Array<{ entityName: string; count: number }>;
+  actions: ErasureEvidenceAction[];
+  postScan: Array<{ entityName: string; count: number }>;
+  verificationResidual: Array<{ entityName: string; count: number }>;
+  artifactHashAlgorithm: 'sha256';
+}
+
+export type DataSubjectOutboxEvent =
+  | {
+      type: 'data_subject.request_created';
+      payload: {
+        requestId: string;
+        requestType: RequestType;
+        tenantId: string;
+        subjectId: string;
+      };
+    }
+  | {
+      type: 'data_subject.erasure_requested';
+      payload: {
+        requestId: string;
+        tenantId: string;
+        subjectId: string;
+        requestedAt: string;
+      };
+    }
+  | {
+      type: 'data_subject.request_completed';
+      payload: {
+        requestId: string;
+        requestType: RequestType;
+        tenantId: string;
+        artifactHash: string;
+        state: 'completed';
+      };
+    }
+  | {
+      type: 'data_subject.request_failed';
+      payload: {
+        requestId: string;
+        requestType: RequestType;
+        tenantId: string;
+        failureReason: string;
+      };
+    };

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import JSZip from 'jszip';
 
+import { exportArtifactKey } from '../../src/artifacts';
 import { ExportRunner } from '../../src/export-runner';
 import { Registry } from '../../src/registry';
 import { InMemoryArtifactStorage } from '../../src/storage/in-memory-artifact-storage';
@@ -48,7 +49,7 @@ describe('ExportRunner', () => {
       true,
     );
 
-    const stored = await artifacts.get('dsr_1.zip');
+    const stored = await artifacts.get(exportArtifactKey('tenant_1', 'dsr_1'));
     expect(stored).not.toBeNull();
 
     const zip = await JSZip.loadAsync(stored!.body);
@@ -70,7 +71,7 @@ describe('ExportRunner', () => {
     const artifacts = new InMemoryArtifactStorage();
     const runner = new ExportRunner(registry, artifacts);
     const result = await runner.run('dsr_2', 'subject_1', 'tenant_1');
-    const stored = await artifacts.get('dsr_2.zip');
+    const stored = await artifacts.get(exportArtifactKey('tenant_1', 'dsr_2'));
     const expected = createHash('sha256').update(stored!.body).digest('hex');
 
     expect(result.artifactHash).toBe(expected);

@@ -1,4 +1,8 @@
 import { DataSubjectErrorCode } from '../../src/errors';
+import {
+  erasureEvidenceArtifactKey,
+  sha256Hex,
+} from '../../src/artifacts';
 import { DataSubjectService } from '../../src/data-subject.service';
 import { Registry } from '../../src/registry';
 import { InMemoryArtifactStorage } from '../../src/storage/in-memory-artifact-storage';
@@ -44,6 +48,7 @@ function svc() {
   const requests = new InMemoryRequestStorage();
   const artifacts = new InMemoryArtifactStorage();
   const outboxEvents: Array<{ type: string; payload: unknown }> = [];
+  const auditEvents: Array<{ type: string; payload: unknown }> = [];
 
   const service = new DataSubjectService({
     registry,
@@ -58,9 +63,12 @@ function svc() {
     publishOutbox: async (type, payload) => {
       outboxEvents.push({ type, payload });
     },
+    publishAudit: async (type, payload) => {
+      auditEvents.push({ type, payload });
+    },
   });
 
-  return { service, requests, artifacts, outboxEvents };
+  return { service, requests, artifacts, outboxEvents, auditEvents };
 }
 
 describe('DataSubjectService', () => {
@@ -104,16 +112,69 @@ describe('DataSubjectService', () => {
   });
 
   it('erase completes successfully with artifact hash', async () => {
-    const { service } = svc();
+    const { service, artifacts } = svc();
 
     const request = await service.erase('subject_1', 'tenant_1');
+    const key = erasureEvidenceArtifactKey('tenant_1', request.id);
+    const stored = await artifacts.get(key);
 
     expect(request.state).toBe('completed');
     expect(request.stats?.entities[0]).toMatchObject({
       entityName: 'User',
       affected: 1,
     });
+    expect(request.stats?.preScan).toEqual([{ entityName: 'User', count: 1 }]);
+    expect(request.stats?.postScan).toEqual([{ entityName: 'User', count: 1 }]);
     expect(request.artifactHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(request.artifactUrl).toBe(`memory://${key}`);
+    expect(stored).not.toBeNull();
+    expect(request.artifactHash).toBe(sha256Hex(stored!.body));
+
+    const body = stored!.body.toString('utf8');
+    expect(body).not.toContain('a@b.com');
+    expect(JSON.parse(body)).toMatchObject({
+      schemaVersion: 'data-subject.erasure-evidence.v1',
+      requestId: request.id,
+      tenantId: 'tenant_1',
+      actions: [
+        {
+          entityName: 'User',
+          affected: 1,
+          deleteFields: ['email'],
+        },
+      ],
+    });
+  });
+
+  it('publishes audit events for request lifecycle transitions', async () => {
+    const { service, auditEvents } = svc();
+
+    const request = await service.export('subject_1', 'tenant_1');
+
+    expect(auditEvents).toContainEqual({
+      type: 'data_subject.request_created',
+      payload: {
+        requestId: request.id,
+        type: 'export',
+        tenantId: 'tenant_1',
+      },
+    });
+    expect(auditEvents).toContainEqual({
+      type: 'data_subject.request_processing',
+      payload: {
+        requestId: request.id,
+        type: 'export',
+        tenantId: 'tenant_1',
+      },
+    });
+    expect(auditEvents).toContainEqual({
+      type: 'data_subject.request_completed',
+      payload: expect.objectContaining({
+        requestId: request.id,
+        type: 'export',
+        tenantId: 'tenant_1',
+      }),
+    });
   });
 
   it('sets dueAt to createdAt + slaDays', async () => {
@@ -197,10 +258,10 @@ describe('DataSubjectService', () => {
     expect(request.failureReason).toBe('boom');
     expect(outboxEvents).toContainEqual({
       type: 'data_subject.request_failed',
-      payload: {
+      payload: expect.objectContaining({
         requestId: request.id,
         failureReason: 'boom',
-      },
+      }),
     });
   });
 
