@@ -368,7 +368,11 @@ GitHub Actions is configured with two workflows:
 
 Release expectations:
 
-- configure repository secret `NPM_TOKEN`
+- configure npm Trusted Publisher for GitHub Actions:
+  - organization/user: `nestarc`
+  - repository: `data-subject`
+  - workflow filename: `release.yml`
+  - environment: `npm`
 - publish a GitHub Release from a tag that matches `v<package.json version>`
 - prerelease versions publish with npm dist-tag `next`
 - stable versions such as `0.2.0` publish with npm dist-tag `latest`
