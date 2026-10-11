@@ -13,12 +13,14 @@ import {
   createPrismaTenancyExtension,
   tenancyTransaction,
 } from '@nestarc/tenancy';
-import { AuditContext, AuditService } from '@nestarc/audit-log';
+import { AuditContext, AuditService, type AuditActor } from '@nestarc/audit-log';
 import { OutboxEmitter, OutboxEvent } from '@nestarc/outbox';
 import { Prisma, PrismaClient } from './generated/client/client';
 
 export interface VerifiedPrincipal {
   actorId: string;
+  /** Set from the authenticated identity; omitted for existing user callers. */
+  actorType?: AuditActor['type'];
   tenantIds: readonly string[];
 }
 
@@ -137,10 +139,12 @@ export function createComposition(options: {
     service, tenancy, audit, outbox,
     /** Authenticate first; independently authorize the requested subject/action. */
     runForTenant<T>(principal: VerifiedPrincipal, tenantId: string, work: () => Promise<T>): Promise<T> {
-      if (!principal.actorId.trim() || !tenantId.trim() || !principal.tenantIds.includes(tenantId))
+      const actorType = principal.actorType ?? 'user';
+      if (!principal.actorId.trim() || !tenantId.trim() || !principal.tenantIds.includes(tenantId) ||
+          !['user', 'system', 'api_key'].includes(actorType))
         throw new Error('Tenant access denied');
       return tenantContext.run(tenantId, () => AuditContext.runAs({
-        id: principal.actorId, type: 'user',
+        id: principal.actorId, type: actorType,
       }, work));
     },
   };

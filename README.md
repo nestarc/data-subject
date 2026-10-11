@@ -426,9 +426,16 @@ The current implementation is intentionally small. A few things are important to
 npm test -- --runInBand
 npm run lint
 npm run build
+npm run examples:check
 # With a disposable PostgreSQL DATABASE_URL:
 npm run test:compatibility
 ```
+
+## Examples
+
+The [tenant-safe host](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe) uses shared policy definitions, signed previews, durable request keys, owner-checked completion recovery, and authenticated artifact delivery. Its policy helpers now return `{ definition, executor }` for the module's `definitions` option; they no longer belong in `entities`. Apply the matching schema checks and transaction wiring described in that example.
+
+`npm run examples:check` type-checks the tenant-safe and private-artifact examples and checks the S3 bridge syntax. Their runtime coverage is part of `npm test`. The [Nestarc composition](docs/nestarc-composition.md) needs generated Prisma 7 types and pinned optional packages, so its strict type check and real database validation run separately via `npm run test:composition`. The local examples check does not substitute for that database test or actual AWS validation.
 
 ## Benchmarks
 

@@ -1,6 +1,8 @@
 # 비공개 export·삭제 증빙 저장소 예제
 
-`examples/private-artifacts/`는 `ArtifactStorage`를 구현하는 실행 가능한 참조 예제다. export ZIP과 삭제 증빙 JSON을 S3 객체로 저장하고, 별도 보존기간·인증된 다운로드·짧은 서명 링크·만료 및 고아 객체 정리를 연결한다. 코어 패키지에 AWS 의존성을 추가하지 않는다. 예제 파일을 애플리케이션으로 복사할 때 `../../src/...` import를 `@nestarc/data-subject` 공개 export로 변경한다.
+`examples/private-artifacts/`는 `ArtifactStorage`를 구현하는 실행 가능한 참조 예제다. `DataSubjectService`의 export ZIP과 삭제 증빙 JSON을 S3 객체로 저장하고, 별도 보존기간·인증된 다운로드·짧은 서명 링크·만료 및 고아 객체 정리를 연결한다. 코어 패키지에 AWS 의존성을 추가하지 않는다. 예제 파일을 애플리케이션으로 복사할 때 `../../src/index` import를 `@nestarc/data-subject`로 변경한다. 저장소 내부에서도 키 생성·SHA-256·타입은 같은 공개 export를 사용한다.
+
+[P2 배치 export](./p2-execution.md)의 NDJSON chunk는 `PostgresJobStore.readChunks()`로 읽는다. 이 예제의 ZIP/JSON 키나 `AuthorizedArtifactDownloads`에 P2 job ID를 전달하지 않는다.
 
 `artifactUrl`에 저장하는 `s3://bucket/key`는 저장 위치다. 브라우저에 공개할 다운로드 주소가 아니다. 실제 다운로드는 요청 소유권을 다시 확인한 다음 바이트를 전달하거나 1~300초짜리 링크를 발급한다.
 
@@ -23,6 +25,7 @@ const artifactStorage = new PrivateS3ArtifactStorage({
   // Illustrative values. Select each period from your actual business policy.
   retentionDays: { export: 7, evidence: 365 },
   createdAt: async ({ tenantId, requestId }) => {
+    // Use the service's requestStorage; durable execution requires durableStore.requests.
     const request = await requestStorage.findById(requestId, tenantId);
     if (!request) throw new Error('Unknown artifact request');
     return request.createdAt;
@@ -61,6 +64,8 @@ const signedUrl = await downloads.link(requestId, actor, 60); // null when expir
 
 `getRequest(requestId, tenantId)` 조회 후 tenant·subject·완료 상태·artifact hash·파일 종류별 권한을 확인한다. 증빙 다운로드에는 별도의 `evidence:download` 권한이 필요하다. 파일 키는 검증한 요청에서 재구성하며 클라이언트가 보낸 키와 저장된 `artifactUrl`을 신뢰하지 않는다. 권한이 없는 요청에는 호스트 라우트에서 일반적인 404 응답을 사용하고 상세 오류나 요청 존재 여부를 노출하지 않는다. HTTP 프록시로 바이트를 전달할 때 `Cache-Control: no-store`, 다운로드 전용 `Content-Disposition`을 설정한다.
 
+이 다운로드 래퍼는 완료 요청만 제공한다. [P1 영구 실행](./p1-migration.md)은 검증 실패의 원래 v2 증빙도 저장할 수 있으며, 업로드 복구 후에도 요청을 `failed`로 유지한다. 해당 실패 증빙을 제공하려면 호스트가 별도 권한·실패 상태 표시를 포함한 조회 경로를 구현한다. 파일이 있다는 이유만으로 요청을 완료 처리하지 않으며, 실패 요청이 참조하는 증빙도 고아 객체로 분류하지 않는다.
+
 서명 링크는 발급 후 소유한 사람이 사용할 수 있는 bearer credential이다. 링크 생성 시 인증을 거쳐도 링크 공유를 막을 수는 없다. 기본 유효시간은 60초이며 객체의 남은 보존기간보다 길게 발급하지 않는다. 서명 시작 시각을 고정해 자격 증명 조회 등 비동기 지연이 만료 시각을 늘리지 않도록 하고, 서명이 끝났을 때 링크가 이미 만료됐다면 반환하지 않는다. 이미 발급된 링크의 즉시 회수·요청마다 다시 인증이 필요하면 링크 대신 `download()`를 통한 서버 전달을 사용한다. IAM session 종료로 링크가 더 일찍 만료될 수도 있다. [AWS presigned URL](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)
 
 ## 실패 업로드와 재시도
@@ -69,6 +74,8 @@ const signedUrl = await downloads.link(requestId, actor, 60); // null when expir
 - `PutObject`는 `IfNoneMatch: '*'`를 사용한다. 같은 키/같은 SHA-256의 재시도는 기존 객체를 사용하며 다른 내용으로 덮어쓰지 않는다. exporter는 재시도 때 원래 payload를 사용해야 한다.
 - 업로드 응답을 잃어도 객체가 존재하고 metadata의 SHA-256·생성 시각·content type이 일치하면 성공으로 복구한다. HEAD도 실패하면 오류를 반환하여 다음 시도에서 다시 확인한다. 불확실한 객체를 즉시 지우지 않는다.
 - 요청 DB 기록 실패 등으로 연결되지 않은 객체는 아래 정리 작업이 처리한다. 재시도 가능한 failed 요청을 고아로 분류하면 안 된다.
+
+P1 `durableStore`를 연결한 요청의 artifact 업로드 실패는 `service.retryCompletion(requestId, tenantId)`으로 저장한 원래 바이트를 재업로드한다. export/erase를 다시 호출해 파일을 재생성하는 방식으로 복구하지 않는다. DB 안의 복구 payload는 요청 생성 시점부터 기본 24시간의 TTL을 가지며 `artifactRetryTtlMs: { export, erase }`로 설정한다. S3의 `retentionDays: { export, evidence }`와는 별개이고, 두 기간 모두 요청 생성 시점부터 계산하므로 재시도 가능한 기간을 함께 정한다.
 
 조건부 업로드는 이를 지원하는 저장소의 원자적 동작에 의존한다. 운영 IAM/bucket policy에서 해당 prefix의 무조건 덮어쓰기를 거절한다. [AWS conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
 
@@ -79,9 +86,11 @@ const signedUrl = await downloads.link(requestId, actor, 60); // null when expir
 ```ts
 const report = await artifactStorage.cleanup({
   orphanGraceMs: 24 * 60 * 60 * 1000,
-  classify: async ({ tenantId, requestId }) => {
+  classify: async ({ tenantId, requestId, kind }) => {
     // Read the authoritative DB, including the host's durable abandonment record.
-    const status = await lifecycleRepository.lookupForCleanup(tenantId, requestId);
+    const status = await lifecycleRepository.lookupForCleanup(tenantId, requestId, kind);
+    // Include evidence referenced by a failed P1 request before considering abandonment.
+    if (status.artifactReferenced) return 'referenced';
     if (status.kind === 'permanently-abandoned') return 'orphaned';
     if (status.kind === 'completed') return 'referenced';
     if (status.kind === 'running' || status.kind === 'retry-pending') return 'active';
@@ -91,14 +100,16 @@ const report = await artifactStorage.cleanup({
 if (report.failed.length) await operationsLogger.recordArtifactCleanupFailure(report);
 ```
 
-`lifecycleRepository`와 `operationsLogger`는 호스트 구현 지점이다. 코어의 `failed` 값만으로 영구 포기를 판정할 수 없다. `classify`를 생략하면 보존기간이 끝난 객체만 정리한다. 고아 분류는 최소 5분의 유예를 강제하고 기본 24시간을 사용한다. DB 장애나 불명확한 상태는 보존한다.
+`lifecycleRepository`와 `operationsLogger`는 호스트 구현 지점이다. `artifactReferenced`는 요청의 artifact hash·저장 위치 및 증빙 기록을 대조해 해당 종류의 파일 참조 여부를 판정한 값이다. 실패한 삭제 증빙도 먼저 참조 여부를 확인한다. 코어의 `failed` 값이나 데이터 실행 복구를 포기했다는 사실만으로 파일의 영구 포기를 판정할 수 없다. `classify`를 생략하면 보존기간이 끝난 객체만 정리한다. 고아 분류는 최소 5분의 유예를 강제하고 기본 24시간을 사용한다. DB 장애나 불명확한 상태는 보존한다.
 
 정리는 고정 prefix를 페이지 단위로 조회하고 키 형식과 소유 metadata를 다시 검사한다. 만료 객체와 명확히 포기된 객체만 HEAD에서 확인한 ETag를 조건으로 삭제한다. 원본 데이터·다른 prefix·알 수 없는 metadata의 객체는 지우지 않는다. 분류·삭제 오류는 `failed`에 남기며 다음 주기에 재시도한다. 목록 조회 자체가 실패하면 작업을 reject하여 전체 정리 성공으로 오인하지 않게 한다. [AWS conditional deletes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-deletes.html)
 
 이 정리 함수를 정기 실행하는 스케줄러는 호스트가 제공한다. 만료가 되면 get/link는 정리 작업 전에 접근을 막지만, 물리적 삭제는 성공한 정리 작업 시점에 완료된다. 실행 주기를 보존 정책에 맞추고 실패 보고를 관찰한다. 고아 분류와 재시도 승인 사이의 경쟁을 막으려면 호스트에서 영구 포기 상태를 불변으로 유지한다.
 
+S3 정리는 DB 안의 파일을 지우지 않는다. P1의 미업로드 복구 payload는 권한 있는 worker에서 `service.expirePendingArtifacts()`로 별도 정리한다. P2 작업의 chunk와 payload는 `jobs.purgeExpiredChunks()`로 별도 정리한다. 각 API의 실패 보고·반복 실행 계약은 [P1 복구 안내](./p1-migration.md)와 [P2 보존 안내](./p2-execution.md)를 따른다.
+
 ## 검증 범위
 
-`npm test -- --runInBand test/integration/private-artifacts.test.ts`는 fake object transport와 SDK command bridge를 검증한다. 별도 보존기간, 같은 키 재시도, 응답 유실, 만료 후 접근/재생성 차단, 페이지별 정리, 삭제/DB 분류 오류 재시도, 다른 namespace 보호, tenant/subject/권한 검사, 무결성 검사, unsafe/versioned bucket 거절을 포함한다.
+`npm test -- --runInBand test/integration/private-artifacts.test.ts`는 fake object transport와 SDK command bridge를 검증한다. 현재 `DataSubjectService`의 ZIP/v2 증빙 저장·인증된 조회, 공개 키 생성기의 인코딩, 별도 보존기간, 같은 키 재시도, 응답 유실, 만료 후 접근/재생성 차단, 페이지별 정리, 삭제/DB 분류 오류 재시도, 다른 namespace 보호, tenant/subject/권한 검사, 완료 요청만 제공하는 경계, 무결성 검사, unsafe/versioned bucket 거절을 포함한다.
 
 이 테스트는 실제 AWS 계정의 IAM, 버킷 정책, KMS, S3 호환 제품의 조건부 연산과 물리적 영구 삭제를 증명하지 않는다. 해당 환경을 검증하기 전에는 운영 S3 호환성 완료로 표시하지 않는다.

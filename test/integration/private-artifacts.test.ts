@@ -1,17 +1,24 @@
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 
-import { AuthorizedArtifactDownloads, VerifiedArtifactActor } from '../../examples/private-artifacts/authorized-downloads';
+import { AuthorizedArtifactDownloads, type VerifiedArtifactActor } from '../../examples/private-artifacts/authorized-downloads';
 import { PrivateS3ArtifactStorage } from '../../examples/private-artifacts/private-s3-storage';
 import type { S3ObjectMetadata, S3Transport } from '../../examples/private-artifacts/s3-transport';
-import { exportArtifactKey, erasureEvidenceArtifactKey } from '../../src/artifacts';
-import type { DataSubjectRequest } from '../../src/types';
+import {
+  DataSubjectService,
+  InMemoryRequestStorage,
+  Registry,
+  exportArtifactKey,
+  erasureEvidenceArtifactKey,
+  sha256Hex,
+  type DataSubjectRequest,
+} from '../../src/index';
 
 const DAY = 86_400_000;
 const exportKey = exportArtifactKey('tenant-a', 'request-a');
 const evidenceKey = erasureEvidenceArtifactKey('tenant-a', 'request-a');
 const body = Buffer.from('private payload');
-const hash = createHash('sha256').update(body).digest('hex');
+const hash = sha256Hex(body);
 type PutInput = Parameters<S3Transport['put']>[0];
 
 class FakeS3 implements S3Transport {
@@ -218,11 +225,19 @@ describe('private S3 artifact example', () => {
     await expect(storage.get(exportKey)).rejects.toThrow('integrity');
   });
 
-  it('supports canonical encoded IDs without interpreting them as paths', async () => {
+  it.each([
+    ['tenant/a', '..'],
+    ['.', 'request/with/slashes'],
+    ['tenant%encoded', '요청 ID'],
+  ])('supports public artifact keys for tenant %s and request %s', async (tenantId, requestId) => {
     const { storage } = fixture();
-    const key = exportArtifactKey('tenant/a', '..');
-    await storage.put(key, body, 'application/zip');
-    await expect(storage.get(key)).resolves.toMatchObject({ body });
+    for (const [key, contentType] of [
+      [exportArtifactKey(tenantId, requestId), 'application/zip'],
+      [erasureEvidenceArtifactKey(tenantId, requestId), 'application/json'],
+    ]) {
+      await storage.put(key, body, contentType);
+      await expect(storage.get(key)).resolves.toEqual({ body, contentType });
+    }
   });
 
   it('propagates listing failure instead of reporting successful cleanup', async () => {
@@ -234,10 +249,45 @@ describe('private S3 artifact example', () => {
 
 describe('authenticated artifact delivery', () => {
   const actor: VerifiedArtifactActor = { actorId: 'actor-a', tenantId: 'tenant-a', subjectId: 'subject-a', permissions: ['export:download'] };
-  const request = {
+  const request: DataSubjectRequest = {
     id: 'request-a', tenantId: 'tenant-a', subjectId: 'subject-a', type: 'export',
     state: 'completed', artifactHash: hash, artifactUrl: 'https://untrusted.invalid/other-tenant',
-  } as DataSubjectRequest;
+    createdAt: new Date('2026-10-11T00:00:00Z'), dueAt: new Date('2026-11-10T00:00:00Z'),
+    completedAt: new Date('2026-10-11T00:00:00Z'), failedAt: null, failureReason: null,
+    stats: { entities: [] }, requestedBy: 'actor-a',
+  };
+
+  it.each(['export', 'erase'] as const)('delivers the current service %s artifact through public APIs', async (type) => {
+    const now = new Date('2026-10-11T00:00:00Z');
+    const requests = new InMemoryRequestStorage();
+    const storage = new PrivateS3ArtifactStorage({
+      transport: new FakeS3(), bucket: 'private-artifact-bucket', prefix: 'privacy/',
+      retentionDays: { export: 1, evidence: 30 }, clock: () => now,
+      createdAt: async ({ tenantId, requestId }) => {
+        const stored = await requests.findById(requestId, tenantId);
+        if (!stored) throw new Error('Unknown artifact request');
+        return stored.createdAt;
+      },
+    });
+    const service = new DataSubjectService({
+      registry: new Registry(), requestStorage: requests, artifactStorage: storage,
+      slaDays: 30, clock: () => now, idFactory: () => 'request-a',
+    });
+    const completed = await service[type]('subject-a', 'tenant-a');
+    expect(completed.state).toBe('completed');
+    const downloads = new AuthorizedArtifactDownloads(service, storage);
+    const artifact = await downloads.download(completed.id, {
+      ...actor, permissions: ['export:download', 'evidence:download'],
+    });
+    expect(sha256Hex(artifact!.body)).toBe(completed.artifactHash);
+    expect(artifact!.contentType).toBe(type === 'export' ? 'application/zip' : 'application/json');
+    if (type === 'erase') {
+      expect(JSON.parse(artifact!.body.toString())).toMatchObject({
+        schemaVersion: 'data-subject.erasure-evidence.v2', requestId: completed.id,
+        tenantId: 'tenant-a', state: 'completed',
+      });
+    }
+  });
 
   it('uses the tenant-scoped lookup and verified subject, never a persisted public URL', async () => {
     const { storage, transport } = fixture();
@@ -265,6 +315,25 @@ describe('authenticated artifact delivery', () => {
     await expect(evidence.link('request-a', actor)).rejects.toThrow('not available');
     const unfinished = new AuthorizedArtifactDownloads({ getRequest: async () => ({ ...request, state: 'failed' }) }, storage);
     await expect(unfinished.link('request-a', actor)).rejects.toThrow('not available');
+  });
+
+  it('keeps uploaded failed erasure evidence outside the completed-request delivery route', async () => {
+    const { storage, transport } = fixture();
+    const artifactUrl = await storage.put(evidenceKey, body, 'application/json');
+    const failedEvidence: DataSubjectRequest = {
+      ...request, type: 'erase', state: 'failed', artifactUrl,
+      completedAt: null, failedAt: new Date('2026-10-11T00:00:00Z'), failureReason: 'dsr_verification_failed',
+      stats: {
+        entities: [],
+        lifecycle: { dataOutcome: 'unknown', failureStage: 'data_execution' },
+        evidence: { schemaVersion: 'data-subject.evidence.v2', artifactHash: hash, artifactUrl },
+      },
+    };
+    const downloads = new AuthorizedArtifactDownloads({ getRequest: async () => failedEvidence }, storage);
+    const evidenceActor: VerifiedArtifactActor = { ...actor, permissions: ['evidence:download'] };
+    await expect(downloads.download('request-a', evidenceActor)).rejects.toThrow('not available');
+    await expect(downloads.link('request-a', evidenceActor)).rejects.toThrow('not available');
+    expect(transport.signs).toHaveLength(0);
   });
 });
 

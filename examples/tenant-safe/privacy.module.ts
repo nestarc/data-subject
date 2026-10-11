@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   CanActivate,
   Controller,
   DynamicModule,
@@ -6,6 +7,7 @@ import {
   ForbiddenException,
   Get,
   Header,
+  HttpException,
   Inject,
   Injectable,
   Module,
@@ -26,11 +28,21 @@ import {
   DataSubjectModuleOptions,
   DataSubjectError,
   DataSubjectErrorCode,
+  DataSubjectPersistenceError,
   DataSubjectRequest,
   DataSubjectService,
+  sha256Hex,
+  type ErasurePreview,
+  type RequestContext,
 } from '../../src';
 
-export type PrivacyAction = 'export' | 'erase' | 'read';
+export type PrivacyAction = 'export' | 'erase' | 'read' | 'retry' | 'export:download' | 'evidence:download';
+
+export interface PrivacyExecutionOptions {
+  durable: boolean;
+  requireErasePreview: boolean;
+}
+const executionOptions = Symbol('example:privacy-execution-options');
 
 export interface AuthenticatedActor {
   actorId: string;
@@ -111,16 +123,28 @@ export class PrivacyIdentityGuard implements CanActivate {
 @Controller('me/privacy')
 @UseGuards(PrivacyIdentityGuard)
 export class PrivacyController {
-  constructor(@Inject(DataSubjectService) private readonly service: DataSubjectService) {}
+  constructor(
+    @Inject(DataSubjectService) private readonly service: DataSubjectService,
+    @Inject(HostAccessService) private readonly access: HostAccessService,
+    @Inject(executionOptions) private readonly options: PrivacyExecutionOptions,
+  ) {}
 
   @Post('exports')
   @SetMetadata(actionMetadata, 'export')
   @Header('Cache-Control', 'no-store')
   async exportOwnData(@Req() request: PrivacyHttpRequest) {
     const principal = requirePrincipal(request);
-    return publicStatus(await this.service.export(principal.subjectId, principal.tenantId, {
-      requestedBy: principal.actorId,
-    }));
+    return publicStatus(await callService(() => this.service.export(
+      principal.subjectId, principal.tenantId, this.requestContext(request, principal),
+    )));
+  }
+
+  @Post('erasure/preview')
+  @SetMetadata(actionMetadata, 'erase')
+  @Header('Cache-Control', 'no-store')
+  async previewOwnErasure(@Req() request: PrivacyHttpRequest) {
+    const principal = requirePrincipal(request);
+    return callService(() => this.service.previewErase(principal.subjectId, principal.tenantId));
   }
 
   @Post('erasure')
@@ -128,9 +152,20 @@ export class PrivacyController {
   @Header('Cache-Control', 'no-store')
   async eraseOwnData(@Req() request: PrivacyHttpRequest) {
     const principal = requirePrincipal(request);
-    return publicStatus(await this.service.erase(principal.subjectId, principal.tenantId, {
-      requestedBy: principal.actorId,
-    }));
+    const preview = readPreview(request.body);
+    if (this.options.requireErasePreview && !preview) throw new BadRequestException('An erasure preview is required');
+    return publicStatus(await callService(() => this.service.erase(principal.subjectId, principal.tenantId, {
+      ...this.requestContext(request, principal), ...(preview ? { preview } : {}),
+    })));
+  }
+
+  @Post('requests/:id/retry-completion')
+  @SetMetadata(actionMetadata, 'retry')
+  @Header('Cache-Control', 'no-store')
+  async retryOwnCompletion(@Param('id') id: string, @Req() request: PrivacyHttpRequest) {
+    const principal = requirePrincipal(request);
+    await this.ownedRequest(id, principal);
+    return publicStatus(await callService(() => this.service.retryCompletion(id, principal.tenantId)));
   }
 
   @Get('requests/:id')
@@ -146,8 +181,15 @@ export class PrivacyController {
   async downloadOwnArtifact(@Param('id') id: string, @Req() request: PrivacyHttpRequest) {
     const principal = requirePrincipal(request);
     const owned = await this.ownedRequest(id, principal);
-    const artifact = await this.service.getArtifact(id, principal.tenantId);
-    if (!artifact) throw new NotFoundException();
+    const permission = owned.type === 'export' ? 'export:download' : 'evidence:download';
+    if (!(await this.access.isAllowed(principal, permission))) throw new ForbiddenException();
+    // Failed erasure evidence needs a separate host-reviewed delivery policy.
+    if (!artifactRecorded(owned)) throw new NotFoundException();
+    const artifact = await callService(() => this.service.getArtifact(id, principal.tenantId));
+    const contentType = owned.type === 'export' ? 'application/zip' : 'application/json';
+    if (!artifact || artifact.contentType !== contentType || sha256Hex(artifact.body) !== owned.artifactHash) {
+      throw new NotFoundException();
+    }
     return new StreamableFile(artifact.body, {
       type: artifact.contentType,
       disposition: owned.type === 'export'
@@ -164,24 +206,48 @@ export class PrivacyController {
       if (error instanceof DataSubjectError && error.code === DataSubjectErrorCode.RequestNotFound) {
         throw new NotFoundException();
       }
-      throw error;
+      return callService(() => Promise.reject(error));
     }
     // Tenant scoping alone does not authorize one user to read another user's request.
     if (request.subjectId !== principal.subjectId) throw new NotFoundException();
     return request;
   }
+
+  private requestContext(request: PrivacyHttpRequest, principal: PrivacyPrincipal): RequestContext {
+    const key = request.headers['idempotency-key'];
+    if (key === undefined && !this.options.durable) return { requestedBy: principal.actorId };
+    if (!this.options.durable) throw new BadRequestException('Idempotency-Key requires durable execution');
+    if (typeof key !== 'string' || !/^[\x21-\x7e]{1,200}$/.test(key)) {
+      throw new BadRequestException('A single 1–200 character Idempotency-Key is required');
+    }
+    return {
+      requestedBy: principal.actorId,
+      // Stable for retries, isolated from other actors and subjects in the same tenant.
+      requestKey: sha256Hex(JSON.stringify([principal.actorId, principal.subjectId, key])),
+    };
+  }
+}
+
+export interface TenantSafePrivacyOptions extends DataSubjectModuleOptions {
+  /** Require the signed preview returned by POST erasure/preview before erasure. */
+  requireErasePreview?: boolean;
 }
 
 @Module({})
 export class TenantSafePrivacyModule {
-  static forRoot(options: DataSubjectModuleOptions, access?: HostAccessService): DynamicModule {
+  static forRoot(options: TenantSafePrivacyOptions, access?: HostAccessService): DynamicModule {
+    const { requireErasePreview = false, ...serviceOptions } = options;
+    if (requireErasePreview && !options.durableStore && !options.runInTransaction) {
+      throw new Error('Required erasure previews need transaction-bound executors');
+    }
     return {
       module: TenantSafePrivacyModule,
-      imports: [DataSubjectModule.forRoot(options)],
+      imports: [DataSubjectModule.forRoot(serviceOptions)],
       controllers: [PrivacyController],
       providers: [
         PrivacyIdentityGuard,
         { provide: HostAccessService, useValue: access ?? new DenyAllHostAccessService() },
+        { provide: executionOptions, useValue: { durable: !!options.durableStore, requireErasePreview } },
       ],
     };
   }
@@ -197,6 +263,35 @@ function isNonblank(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
+function readPreview(body: unknown): ErasurePreview | undefined {
+  if (body === undefined) return undefined;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new BadRequestException('Expected an object body');
+  if (!Object.hasOwn(body, 'preview')) return undefined;
+  const preview = (body as { preview: unknown }).preview;
+  if (!preview || typeof preview !== 'object' || Array.isArray(preview)) throw new BadRequestException('Invalid erasure preview');
+  // The core verifies the signature, scope, expiry and current plan inside execution.
+  return preview as ErasurePreview;
+}
+
+async function callService<T>(work: () => Promise<T>): Promise<T> {
+  try { return await work(); }
+  catch (error) {
+    if (error instanceof DataSubjectError) {
+      throw new HttpException({
+        code: error.code,
+        ...(error instanceof DataSubjectPersistenceError ? {
+          requestId: error.requestId, dataOutcome: error.dataOutcome, recovery: error.recovery,
+        } : {}),
+      }, error.httpStatus);
+    }
+    throw error;
+  }
+}
+
+function artifactRecorded(request: DataSubjectRequest): boolean {
+  return request.state === 'completed' && request.artifactHash !== null && !request.stats?.lifecycle?.artifactFailure;
+}
+
 function publicStatus(request: DataSubjectRequest) {
   return {
     id: request.id,
@@ -208,6 +303,9 @@ function publicStatus(request: DataSubjectRequest) {
     failedAt: request.failedAt,
     failureReason: request.failureReason,
     lifecycle: request.stats?.lifecycle,
-    artifactReady: request.state === 'completed' && request.artifactHash !== null,
+    verification: request.stats?.verification,
+    evidenceVersion: request.stats?.evidence?.schemaVersion,
+    // Metadata only: the private object may have expired since it was written.
+    artifactReady: artifactRecorded(request),
   };
 }

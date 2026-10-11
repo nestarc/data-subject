@@ -1,5 +1,8 @@
-import { erasureEvidenceArtifactKey, exportArtifactKey } from '../../src/artifacts';
-import type { DataSubjectService } from '../../src/data-subject.service';
+import {
+  erasureEvidenceArtifactKey,
+  exportArtifactKey,
+  type DataSubjectService,
+} from '../../src/index';
 import type { PrivateS3ArtifactStorage } from './private-s3-storage';
 
 export interface VerifiedArtifactActor {
@@ -10,7 +13,7 @@ export interface VerifiedArtifactActor {
   permissions: ReadonlyArray<'export:download' | 'evidence:download'>;
 }
 
-/** Host identity/subject verification must finish before constructing the actor. */
+/** Delivers completed requests after the host has verified the actor and subject. */
 export class AuthorizedArtifactDownloads {
   constructor(
     private readonly service: Pick<DataSubjectService, 'getRequest'>,

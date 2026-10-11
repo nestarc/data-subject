@@ -29,7 +29,18 @@ Nestarc 버전은 공개 npm registry에서 확인하고 설치했다. data-subj
 4. 데이터 commit과 artifact 처리가 끝난 후 별도 전달 transaction에서 `AuditService.log(input, tx)`와 `OutboxEmitter.emit(tx, event, options)`를 호출한다. 각 행과 data-subject의 전달 완료 표시는 이 전달 transaction에 함께 참여한다. audit/outbox 행은 원래 업무 데이터 transaction에 직접 삽입되는 것이 아니다.
 5. outbox consumer나 broker publisher는 호스트가 별도로 설정한다. 여기서 outbox 행의 저장 성공은 외부 소비자의 처리 완료를 뜻하지 않는다. 외부 전달은 중복 가능하므로 소비자는 전달 ID로 중복을 처리해야 한다.
 
-기본 이벤트 payload는 request ID와 notification ID만 포함한다. subject ID, artifact URL, 원본 field 값은 외부 이벤트나 감사 metadata로 복제하지 않는다. 감사 actor는 **전달 시 실행한 인증된 actor**다. 최초 요청자의 식별자는 data-subject 요청의 `requestedBy`로 따로 보존한다. 재시도를 담당하는 worker는 사용자로 가장하지 않고 자신의 service actor를 전달한다.
+기본 이벤트 payload는 request ID와 notification ID만 포함한다. subject ID, artifact URL, 원본 field 값은 외부 이벤트나 감사 metadata로 복제하지 않는다. 감사 actor는 **전달 시 실행한 인증된 actor**다. 최초 요청자의 식별자는 data-subject 요청의 `requestedBy`로 따로 보존한다. `VerifiedPrincipal.actorType`은 audit-log 0.7.0의 공개 `AuditActor` 타입을 따르며 생략하면 기존 호출과 같이 `user`다. 호스트가 인증한 내부 worker에는 `system`, API key 주체에는 `api_key`를 명시한다. actor 종류와 tenant 목록을 HTTP header/body에서 그대로 받지 않는다.
+
+```ts
+// 호스트가 worker 자격과 tenant 접근 권한을 확인한 뒤 구성한다.
+await composition.runForTenant({
+  actorId: 'completion-worker',
+  actorType: 'system',
+  tenantIds: [authorizedTenantId],
+}, authorizedTenantId, () => composition.service.retryCompletion(requestId, authorizedTenantId));
+```
+
+이미 전달된 감사 행의 actor는 유지되며, worker가 재전달한 행은 worker 자신의 ID와 종류를 기록한다. `requestedBy`는 원래 요청자의 식별자를 유지한다.
 
 ## 중복 전달과 실패 처리
 
@@ -57,6 +68,6 @@ DATABASE_URL=postgresql://USER:PASSWORD@127.0.0.1:5432/DISPOSABLE_DB \
 
 runner는 고유 schema를 만들고 종료 시 자신이 생성한 schema와 role만 제거한다. npm cache는 OS 임시 디렉터리를 사용한다. 진단을 위해 임시 consumer를 남기려면 `KEEP_COMPOSITION_WORKSPACE=1`을 지정한다.
 
-검증하는 동작은 엄격한 타입 검사, Nest provider 초기화, 실제 RLS가 있는 두 tenant의 같은 subject export/erase 처리, export 허용 목록, 읽기 전용 미리보기, 다른 tenant의 요청 조회 거절, 데이터 변경의 롤백, lifecycle 감사·outbox 행, 삽입 직후 callback 실패의 savepoint 롤백, 전달만 재시도, 동일 요청 반복 및 저장된 통지 ID 재전달 시 실행/통지 중복 방지, pooled connection의 tenant context 누출 방지다. 2026-10-11 로컬 임시 PostgreSQL에서 이 경로를 통과했다. artifact 저장소는 이 fixture에서 메모리 구현을 사용하므로 실제 S3 연결 검증은 포함하지 않는다.
+검증하는 동작은 엄격한 타입 검사, Nest provider 초기화, 실제 RLS가 있는 두 tenant의 같은 subject export/erase 처리, export 허용 목록, 읽기 전용 미리보기, 다른 tenant의 요청 조회 거절, 데이터 변경의 롤백, lifecycle 감사·outbox 행, 감사·outbox 삽입 직후 callback 실패의 savepoint 롤백, service actor의 전달만 재시도와 원래 `requestedBy` 보존, 동일 요청 반복 및 저장된 통지 ID 재전달 시 실행/통지 중복 방지, pooled connection의 tenant context 누출 방지다. 2026-10-11 로컬 임시 PostgreSQL에서 이 경로를 통과했다. artifact 저장소는 이 fixture에서 메모리 구현을 사용하므로 실제 S3 연결 검증은 포함하지 않는다.
 
 outbox poller, broker, webhook delivery, audit 자동 모델 추적, managed pooler, Prisma 5/6, Nest 10/12의 **이 세 패키지 조합**은 이 fixture의 검증 범위에 포함하지 않는다. 개별 data-subject 지원표는 [compatibility.md](compatibility.md)를 따른다. 실제 고객 schema의 검증은 별도 도입 단계다.

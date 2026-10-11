@@ -10,7 +10,7 @@ import { TenancyService } from '@nestarc/tenancy';
 import { OutboxEmitter } from '@nestarc/outbox';
 import { DataSubjectService, InMemoryArtifactStorage, Registry, definePolicy, fromPrisma, type PrismaDelegate } from '@nestarc/data-subject';
 import { PrismaClient } from './generated/client/client';
-import { createComposition } from './composition';
+import { createComposition, type VerifiedPrincipal } from './composition';
 
 const schema = process.env.COMPOSITION_SCHEMA!;
 assert.match(schema, /^ds_composition_[a-f0-9]{32}$/);
@@ -25,6 +25,9 @@ const db = new PrismaClient({ adapter: new PrismaPg({
   connectionString: appUrl.toString(), options: `-c search_path=${schema}`,
 }, { schema }) });
 const principal = { actorId: 'verified-operator', tenantIds: ['tenant-a', 'tenant-b'] };
+const worker: VerifiedPrincipal = {
+  actorId: 'completion-worker', actorType: 'system', tenantIds: ['tenant-a'],
+};
 let eraseCalls = 0;
 
 function registry(client: () => { profile: PrismaDelegate }, failAfterErase = false): Registry {
@@ -118,8 +121,8 @@ async function main(): Promise<void> {
       const eventRows = (await admin.query('SELECT tenant_id, payload, idempotency_key FROM outbox_events WHERE aggregate_id = $1', [result.id])).rows;
       assert.ok(eventRows.every(row => row.tenant_id === 'tenant-a' && row.idempotency_key === row.payload.notificationId));
       assert.ok(eventRows.every(row => !('subjectId' in row.payload) && !('artifactUrl' in row.payload)));
-      const audits = (await admin.query('SELECT tenant_id, actor_id, metadata FROM audit_logs WHERE target_id = $1', [result.id])).rows;
-      assert.ok(audits.every(row => row.tenant_id === 'tenant-a' && row.actor_id === principal.actorId && row.metadata.notificationId));
+      const audits = (await admin.query('SELECT tenant_id, actor_id, actor_type, metadata FROM audit_logs WHERE target_id = $1', [result.id])).rows;
+      assert.ok(audits.every(row => row.tenant_id === 'tenant-a' && row.actor_id === principal.actorId && row.actor_type === 'user' && row.metadata.notificationId));
       const before = eraseCalls;
       const replay = await c.service.erase('same-subject', 'tenant-a', { requestKey: 'same-key', requestedBy: principal.actorId, preview });
       assert.equal(replay.id, result.id);
@@ -140,17 +143,35 @@ async function main(): Promise<void> {
       await originalEmit(...args);
       if (failOnce) { failOnce = false; throw new Error('injected after outbox insert'); }
     };
-    await c.runForTenant(principal, 'tenant-a', async () => {
-      const result = await c.service.erase('retry-subject', 'tenant-a', { requestKey: 'retry-key' });
+    const originalAudit = c.audit.log.bind(c.audit);
+    let failAuditOnce = true;
+    c.audit.log = async (...args) => {
+      await originalAudit(...args);
+      if (failAuditOnce) { failAuditOnce = false; throw new Error('injected after audit insert'); }
+    };
+    const retryRequest = await c.runForTenant(principal, 'tenant-a', async () => {
+      const result = await c.service.erase('retry-subject', 'tenant-a', {
+        requestKey: 'retry-key', requestedBy: principal.actorId,
+      });
       assert.equal(result.state, 'completed');
-      assert.equal(result.stats?.lifecycle?.notificationFailures?.length, 1);
+      assert.equal(result.stats?.lifecycle?.notificationFailures?.length, 2);
       assert.equal(await count('outbox_events', result.id), 2, 'savepoint undoes insertion before failed callback');
+      assert.equal(await count('audit_logs', result.id), 2, 'savepoint also undoes failed audit insertion');
+      return result;
+    });
+    // A separately authenticated background worker resumes delivery as itself.
+    await c.runForTenant(worker, 'tenant-a', async () => {
+      const result = retryRequest;
       const before = eraseCalls;
       const recovered = await c.service.retryCompletion(result.id, 'tenant-a');
       assert.equal(recovered.stats?.lifecycle?.notificationFailures, undefined);
+      assert.equal(recovered.requestedBy, principal.actorId, 'recovery preserves the original requester');
       assert.equal(eraseCalls, before);
       assert.equal(await count('outbox_events', result.id), 3);
       assert.equal(await count('audit_logs', result.id), 3);
+      const audits = (await admin.query('SELECT actor_id, actor_type FROM audit_logs WHERE target_id = $1', [result.id])).rows;
+      assert.equal(audits.filter(row => row.actor_id === worker.actorId && row.actor_type === 'system').length, 1);
+      assert.equal(audits.filter(row => row.actor_id === principal.actorId && row.actor_type === 'user').length, 2);
       await c.service.retryCompletion(result.id, 'tenant-a');
       assert.equal(await count('outbox_events', result.id), 3);
       // Exercise receipt deduplication directly by replaying persisted IDs.
@@ -186,7 +207,7 @@ async function main(): Promise<void> {
       assert.equal((await admin.query('SELECT count(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2', [result.id, 'data_subject.request_completed'])).rows[0].count, '0');
     });
     assert.equal(await db.profile.count(), 0, 'transaction-local tenant context does not leak through pooled connections');
-    console.log('PASS Nestarc composition: exact published packages, strict types, Nest providers, PostgreSQL RLS, export/erase tenant isolation, lifecycle audit/outbox, callback rollback/retry/deduplication, data rollback');
+    console.log('PASS Nestarc composition: exact published packages, strict types, Nest providers, PostgreSQL RLS, export/erase tenant isolation, lifecycle audit/outbox, service-actor retry, callback rollback/retry/deduplication, data rollback');
   } finally {
     await module?.close();
     await db.$disconnect();

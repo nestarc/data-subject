@@ -1,0 +1,12 @@
+// Business-model fragment for tenantUserDefinitions.
+// A single-tenant database omits tenantId and uses singleTenantUserDefinitions.
+// Field deletion writes null, so all four personal-data columns are nullable.
+model User {
+  id           String  @id
+  userId       String
+  tenantId     String
+  email        String?
+  displayName  String?
+  passwordHash String?
+  sessionToken String?
+}

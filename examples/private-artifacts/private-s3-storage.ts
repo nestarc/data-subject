@@ -1,6 +1,9 @@
-import { createHash } from 'node:crypto';
-
-import type { ArtifactStorage } from '../../src/storage/artifact-storage.interface';
+import {
+  erasureEvidenceArtifactKey,
+  exportArtifactKey,
+  sha256Hex,
+  type ArtifactStorage,
+} from '../../src/index';
 import type { S3ObjectMetadata, S3Transport } from './s3-transport';
 
 const OWNER = 'data-subject.private-artifacts.v1';
@@ -75,7 +78,7 @@ export class PrivateS3ArtifactStorage implements ArtifactStorage {
     const expiresAt = created + this.options.retentionDays[identity.kind] * DAY;
     if (!Number.isFinite(created) || created > this.now()) throw new Error('Invalid artifact creation time');
     if (expiresAt <= this.now()) throw new Error('Artifact has expired');
-    const hash = digest(body);
+    const hash = sha256Hex(body);
     const input = this.objectInput(key);
     try {
       await this.options.transport.put({
@@ -128,7 +131,7 @@ export class PrivateS3ArtifactStorage implements ArtifactStorage {
     const fetched = inspectMetadata(object);
     assertExpectedHash(fetched.hash, expectedHash);
     if (fetched.expiresAt <= this.now()) return null;
-    if (object.body.length > this.maxBytes || digest(object.body) !== fetched.hash) {
+    if (object.body.length > this.maxBytes || sha256Hex(object.body) !== fetched.hash) {
       throw new Error('Artifact integrity check failed');
     }
     return { body: object.body, contentType: object.ContentType! };
@@ -247,16 +250,17 @@ export function parseArtifactKey(key: string): ArtifactIdentity {
   if (!match) throw new Error('Invalid artifact key');
   const decode = (part: string) => {
     const value = decodeURIComponent(part);
-    const canonical = value === '.' || value === '..'
-      ? value.replace(/\./g, '%2E') : encodeURIComponent(value);
-    if (!value.trim() || part !== canonical) throw new Error('Invalid artifact key segment');
+    if (!value.trim()) throw new Error('Invalid artifact key segment');
     return value;
   };
-  return { tenantId: decode(match[1]), requestId: decode(match[2]), kind: match[3] === 'export.zip' ? 'export' : 'evidence' };
-}
-
-function digest(body: Buffer): string {
-  return createHash('sha256').update(body).digest('hex');
+  const tenantId = decode(match[1]);
+  const requestId = decode(match[2]);
+  const kind = match[3] === 'export.zip' ? 'export' : 'evidence';
+  const canonical = kind === 'export'
+    ? exportArtifactKey(tenantId, requestId)
+    : erasureEvidenceArtifactKey(tenantId, requestId);
+  if (key !== canonical) throw new Error('Invalid artifact key segment');
+  return { tenantId, requestId, kind };
 }
 
 function assertExpectedHash(hash: string, expected?: string): void {
