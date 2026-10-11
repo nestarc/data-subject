@@ -2,9 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes under Unreleased describe the current source build and are not part of the tagged 0.2.0 release; the package version has not yet been advanced.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Unreleased tracks changes after the latest versioned section. Versioned notes describe release contents; tagging and npm publication are separate release steps.
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-10-11
+
+This pre-1.0 minor release includes breaking changes from 0.2.0 and the P0/P1/P2 improvements below. Before upgrading, follow the [P0 migration guide](docs/p0-migration.md) for export allowlists, tenant scope, and request-storage contracts, and the [P1 migration guide](docs/p1-migration.md) for stable-ID verification and optional durable execution. Apply the separate [P2 migrations](docs/p2-execution.md) only when enabling the job queue. The tenant-safe example's policy helpers move from `entities` to `definitions`.
 
 ### Fixed
 

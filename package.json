@@ -1,6 +1,6 @@
 {
   "name": "@nestarc/data-subject",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Tenant-scoped data export and verified erasure for NestJS + Prisma, with shared policies, signed previews, durable recovery, and paged jobs.",
   "license": "MIT",
   "author": "nestarc",

@@ -1,6 +1,6 @@
 # @nestarc/data-subject — v0.1 Technical Spec
 
-Status: Historical v0.1 planning spec. For the current 0.2.0 implementation target, see [data-subject-0.2.0-spec.md](./data-subject-0.2.0-spec.md).
+Status: Historical v0.1 planning spec. For current behavior and migration guidance, see the [README](../README.md) and [changelog](../CHANGELOG.md). The [0.2.0 spec](./data-subject-0.2.0-spec.md) records the subsequent historical design.
 
 본 문서는 v0.1에서 고정되는 기술 결정을 기록한다. 변경은 RFC 수준의 논의를 거친다.
 

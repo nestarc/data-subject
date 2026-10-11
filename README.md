@@ -21,7 +21,7 @@ The current source build provides:
 
 ## Current Scope
 
-Package metadata remains at `0.2.0`. This source build includes unreleased P0/P1/P2, benchmark, and example improvements recorded in the [changelog](CHANGELOG.md). The setup and API descriptions below apply to this source build; see the tagged release documentation when using a released tarball.
+Package version: `0.3.0`. This pre-1.0 release includes breaking changes from `0.2.0`, together with P0/P1/P2, benchmark, and example improvements recorded in the [changelog](CHANGELOG.md). Follow the migration guides below when upgrading. These instructions describe the 0.3.0 source build; use matching release documentation for older tarballs.
 
 This repository focuses on the execution core plus the minimum production trust layer. It does **not** currently ship:
 
@@ -37,10 +37,11 @@ If you need database-specific behavior, you can plug in your own `EntityExecutor
 ## Installation
 
 ```bash
-npm install @nestarc/data-subject
+# Once 0.3.0 is available in your registry:
+npm install @nestarc/data-subject@0.3.0
 ```
 
-For the unreleased APIs below, build this checkout with `npm ci && npm run build && npm pack` and install the resulting tarball into your application. Installing the registry version does not select this checkout.
+To validate this checkout before publication, run `npm ci && npm run build && npm pack` and install the resulting `nestarc-data-subject-0.3.0.tgz` into your application. Updating repository metadata does not publish an npm release.
 
 Node.js 20 or newer is required; the chosen Prisma/Nest versions may impose stricter requirements. Peer dependencies used by this package:
 
@@ -484,7 +485,7 @@ GitHub Actions is configured with two workflows:
 
 Release expectations:
 
-- select the next release version, update package/lockfile versions and this changelog, and complete the compatibility/example checks before tagging these unreleased breaking changes
+- keep package/lockfile versions and the changelog in sync, and complete the compatibility/example checks before tagging a release
 
 - configure npm Trusted Publisher for GitHub Actions:
   - organization/user: `nestarc`
@@ -493,7 +494,7 @@ Release expectations:
   - environment: `npm`
 - publish a GitHub Release from a tag that matches `v<package.json version>`
 - prerelease versions publish with npm dist-tag `next`
-- stable versions such as `0.2.0` publish with npm dist-tag `latest`
+- non-prerelease versions such as `0.3.0` publish with npm dist-tag `latest`
 
 ## Related Docs
 
