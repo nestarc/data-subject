@@ -13,6 +13,11 @@ import {
 } from './lint';
 
 const nodeRequire = createRequire(__filename);
+// TypeScript's CommonJS output rewrites import() to require(), which cannot load
+// file: URLs or ES modules on all supported Node versions. Keep a native import.
+const importEsmConfig = new Function('url', 'return import(url)') as (
+  url: string,
+) => Promise<{ default?: DataSubjectLintConfig }>;
 
 interface CliOptions {
   command?: string;
@@ -127,9 +132,7 @@ async function loadConfig(
   }
 
   if (ext === '.mjs') {
-    const mod = (await import(pathToFileURL(fullPath).href)) as {
-      default?: DataSubjectLintConfig;
-    };
+    const mod = await importEsmConfig(pathToFileURL(fullPath).href);
     return mod.default ?? {};
   }
 

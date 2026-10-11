@@ -348,10 +348,22 @@ function validateRelations(
           field.name,
         );
       }
-      if (!child || !parent || !deletesRow(parent)) continue;
+      if (!child || !parent) continue;
+      const parentDeletesRow = deletesRow(parent);
+      const parentUpdatesReference =
+        !parentDeletesRow &&
+        relation.references.some((name) => {
+          const policy = parent.fields[name];
+          return policy && (policy === 'delete' || policy.strategy !== 'retain');
+        });
+      if (!parentDeletesRow && !parentUpdatesReference) continue;
+      const parentChange = parentDeletesRow ? 'parent deletion' : 'parent referenced-field update';
+      const referentialAction = parentDeletesRow ? relation.onDelete : relation.onUpdate;
       const detaches =
         relation.fields.length > 0 &&
-        relation.fields.every((name) => {
+        // PostgreSQL/Prisma MATCH SIMPLE stops matching once any FK component is NULL.
+        // A required tenant component can remain intact while a nullable subject FK clears.
+        relation.fields.some((name) => {
           const scalar = model.fields.find((item) => item.name === name);
           const policy = child.fields[name];
           return (
@@ -366,7 +378,7 @@ function validateRelations(
         add(
           'dsr_lint_dependency_order',
           child.entityName,
-          `Declare dependsOn: ["${parent.entityName}"] so child writes precede parent deletion`,
+          `Declare dependsOn: ["${parent.entityName}"] so child writes precede ${parentChange}`,
           field.name,
         );
       if (!deletesRow(child) && !detaches) {
@@ -376,7 +388,7 @@ function validateRelations(
         add(
           retains ? 'dsr_lint_retention_conflict' : 'dsr_lint_relation_conflict',
           model.name,
-          `Parent row deletion (${relation.onDelete ?? 'Prisma default'}) conflicts with child rows that are neither deleted nor detached`,
+          `${parentChange} (${referentialAction ?? 'Prisma default'}) conflicts with child rows that are neither deleted nor detached`,
           field.name,
         );
       }

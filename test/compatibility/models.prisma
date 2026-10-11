@@ -36,6 +36,66 @@ model GraphSession {
   @@index([tenantId, subjectId])
 }
 
+model BatchItem {
+  id           String @id
+  tenantId     String
+  subjectId    String
+  email        String?
+  total        Int
+  passwordHash String?
+  @@index([tenantId, subjectId, id])
+}
+
+model ScalarItem {
+  id              String @id
+  tenantId        String
+  subjectId       String
+  happenedAt      DateTime?
+  decimalNumber   Decimal?
+  decimalString   Decimal?
+  bigintNumber    BigInt?
+  bigintString    BigInt?
+  retainedDecimal Decimal?
+  @@index([tenantId, subjectId, id])
+}
+
+model CompositeParent {
+  id        String @id
+  tenantId  String
+  subjectId String
+  email     String
+  children  CompositeChild[]
+  @@unique([tenantId, id])
+}
+
+model CompositeChild {
+  id        String @id
+  tenantId  String
+  subjectId String
+  parentId  String?
+  total     Int
+  parent    CompositeParent? @relation(fields: [tenantId, parentId], references: [tenantId, id], onDelete: Restrict)
+  @@index([tenantId, subjectId])
+}
+
+model CascadeParent {
+  id        String @id
+  tenantId  String
+  subjectId String
+  email     String @unique
+  children  CascadeChild[]
+}
+
+model CascadeChild {
+  id        String @id
+  tenantId  String
+  subjectId String
+  ownerEmail String
+  total     Int
+  parent    CascadeParent @relation(fields: [ownerEmail], references: [email], onDelete: Restrict, onUpdate: Cascade)
+  @@index([tenantId, subjectId])
+}
+
 model DataSubjectRequest {
   id            String @id
   tenantId      String

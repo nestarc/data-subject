@@ -201,6 +201,102 @@ describe('shared policy schema lint', () => {
     expect(lintPrismaSchema(schema, { definitions })).toEqual({ ok: true, findings: [] });
   });
 
+  it.each(['delete', { strategy: 'anonymize', replacement: null }] as const)(
+    'accepts composite FK detachment by one nullable component while retaining required tenantId (%p)',
+    (userPolicy) => {
+      const definitions = structuredClone(related);
+      definitions[1].rowLevel = 'delete-fields';
+      definitions[1].fields.tenantId = { strategy: 'retain', legalBasis: 'tax:law' };
+      definitions[1].fields.userId = userPolicy;
+      definitions[1].fields.amount = { strategy: 'retain', legalBasis: 'tax:law' };
+      const schema = relatedSchema
+        .replace('userId String', 'userId String?')
+        .replace('user User @relation', 'user User? @relation')
+        .replace(
+          'fields: [userId], references: [id]',
+          'fields: [tenantId, userId], references: [tenantId, id]',
+        )
+        .replace('invoices Invoice[]', 'invoices Invoice[]\n    @@unique([tenantId, id])');
+      expect(lintPrismaSchema(schema, { definitions })).toEqual({ ok: true, findings: [] });
+
+      definitions[1].fields.userId = { strategy: 'retain', legalBasis: 'tax:law' };
+      expect(lintPrismaSchema(schema, { definitions }).findings).toContainEqual(
+        expect.objectContaining({ code: 'dsr_lint_retention_conflict', field: 'user' }),
+      );
+      definitions[1].fields.userId = { strategy: 'anonymize', replacement: 'still-linked' };
+      expect(lintPrismaSchema(schema, { definitions }).ok).toBe(false);
+    },
+  );
+
+  it.each(['Cascade', 'SetNull', 'Restrict', 'NoAction', 'default'])(
+    'rejects linked child retention when a referenced parent field is updated (onUpdate %s)',
+    (action) => {
+      const schema = relatedSchema
+        .replace('email String?', 'email String?\n    referenceCode String? @unique')
+        .replace('userId String', 'userId String?')
+        .replace('user User @relation', 'user User? @relation')
+        .replace(
+          'references: [id], onDelete: Cascade',
+          `references: [referenceCode]${action === 'default' ? '' : `, onUpdate: ${action}`}`,
+        );
+      const definitions = structuredClone(related);
+      definitions[0].rowLevel = 'delete-fields';
+      definitions[0].fields.referenceCode = { strategy: 'anonymize', replacement: '[removed]' };
+      definitions[1].rowLevel = 'delete-fields';
+      definitions[1].fields.userId = { strategy: 'retain', legalBasis: 'tax:law' };
+      definitions[1].fields.amount = { strategy: 'retain', legalBasis: 'tax:law' };
+      delete definitions[1].dependsOn;
+      const report = lintPrismaSchema(schema, { definitions });
+      expect(report.findings).toContainEqual(
+        expect.objectContaining({ code: 'dsr_lint_dependency_order', model: 'Invoice' }),
+      );
+      expect(report.findings).toContainEqual(
+        expect.objectContaining({ code: 'dsr_lint_retention_conflict', field: 'user' }),
+      );
+      expect(
+        report.findings.some((finding) =>
+          finding.message.includes(action === 'default' ? 'Prisma default' : action),
+        ),
+      ).toBe(true);
+
+      definitions[1].dependsOn = ['User'];
+      definitions[1].fields.userId = 'delete';
+      expect(lintPrismaSchema(schema, { definitions })).toEqual({ ok: true, findings: [] });
+      definitions[0].fields.referenceCode = 'delete';
+      expect(lintPrismaSchema(schema, { definitions })).toEqual({ ok: true, findings: [] });
+      definitions[1].fields.userId = {
+        strategy: 'anonymize',
+        replacement: 'joint-change-is-unsupported',
+      };
+      expect(lintPrismaSchema(schema, { definitions }).ok).toBe(false);
+    },
+  );
+
+  it('allows child row deletion before a referenced parent key update', () => {
+    const schema = relatedSchema
+      .replace('email String?', 'email String?\n    referenceCode String @unique')
+      .replace(
+        'references: [id], onDelete: Cascade',
+        'references: [referenceCode], onUpdate: Cascade',
+      );
+    const definitions = structuredClone(related);
+    definitions[0].rowLevel = 'delete-fields';
+    definitions[0].fields.referenceCode = { strategy: 'anonymize', replacement: '[removed]' };
+    expect(lintPrismaSchema(schema, { definitions })).toEqual({ ok: true, findings: [] });
+  });
+
+  it('does not require child deletion for parent updates unrelated to referenced keys', () => {
+    const definitions = structuredClone(related);
+    definitions[0].rowLevel = 'delete-fields';
+    definitions[1].fields = { amount: { strategy: 'retain', legalBasis: 'tax:law' } };
+    definitions[1].ignoredFields = {
+      userId: 'retained relation',
+      note: 'non-personal bookkeeping',
+    };
+    delete definitions[1].dependsOn;
+    expect(lintPrismaSchema(relatedSchema, { definitions })).toEqual({ ok: true, findings: [] });
+  });
+
   it('rejects cyclic dependency declarations and implicit many-to-many relations', () => {
     const definitions = structuredClone(related);
     definitions[0].dependsOn = ['Invoice'];

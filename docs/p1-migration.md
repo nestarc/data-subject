@@ -51,7 +51,7 @@ npx data-subject lint --schema prisma/schema.prisma --config data-subject.config
 
 `relations`에는 검토한 Prisma 관계 필드명을 명시한다. `dependsOn`은 부모 엔티티 이름이며 자식을 먼저 실행한다. 예를 들어 `Invoice.user → User` 관계라면 `Invoice` 정의에 `relations: ['user'], dependsOn: ['User']`, `User` 정의에 역방향 관계 필드 `relations: ['invoices']`를 넣는다. 등록 순서 대신 이 의존 순서를 사용한다.
 
-부모 행을 삭제할 때 자식은 먼저 행 삭제되거나 nullable FK를 null로 바꿔 연결을 끊어야 한다. 보존 중인 자식을 그대로 연결한 부모 삭제는 `Cascade` 포함 관계 충돌로 검출한다. nullable 필드를 required로 변경했는데 null 삭제 정책을 유지한 경우도 실패한다. 순환 관계, 명시하지 않은 관계, 미등록 관계 대상, implicit many-to-many는 지원하지 않는다. 별도 join 모델과 명시적인 정책을 사용한다. 임의의 관계를 찾아 자동 삭제하지 않는다.
+부모 행을 삭제하거나 자식이 참조하는 부모 키를 변경할 때 자식은 먼저 행 삭제되거나 nullable FK를 null로 바꿔 연결을 끊어야 한다. 복합 FK는 nullable 구성요소 하나를 null로 만들면 연결이 해제되므로 required tenant 키는 그대로 유지할 수 있다. 보존 중인 자식을 그대로 연결한 부모 삭제·참조키 변경은 `onDelete`와 `onUpdate`의 `Cascade`를 포함해 관계 충돌로 검출한다. nullable 필드를 required로 변경했는데 null 삭제 정책을 유지한 경우도 실패한다. 순환 관계, 명시하지 않은 관계, 미등록 관계 대상, implicit many-to-many는 지원하지 않는다. 별도 join 모델과 명시적인 정책을 사용한다. 임의의 관계를 찾아 자동 삭제하지 않는다.
 
 파서는 한 줄에 완성된 필드/속성을 두는 제한된 Prisma schema 구문을 지원한다. `model`, `enum`, `generator`, `datasource`, scalar nullability, 명시한 FK/reference, 일반적인 속성을 읽고 알 수 없거나 잘린 구문은 실패 처리한다. composite type/view와 여러 줄 필드 선언 등은 미지원이다. 전체 Prisma 구문·타입·DB 의미 검증기를 대신하지 않으므로 `prisma validate`와 lint를 함께 실행한다.
 
@@ -70,6 +70,8 @@ registry.registerDefinition(definitions[0], executor);
 `fromPrisma`의 `stableIdField` 기본값은 `id`다. 한 행을 식별하는 불변의 유일한 scalar 컬럼을 사용한다. 복합 ID를 단일 ID로 간주하지 않는다. custom executor는 `identityField`와 `selectByIds(ids, tenantId)`를 제공하고, 후자는 변경될 수 있는 subject 필터 대신 tenant와 안정적인 ID로 동일 행을 읽어야 한다. 정책의 `stableIdField`와 executor의 `identityField`가 다르면 거절한다.
 
 실행 전에 ID 누락·중복·조회 불일치와 정책 필드 누락을 확인한다. 검증할 수 없는 executor는 기본적으로 `dsr_verification_unavailable`로 삭제 전에 실패한다. 모든 엔티티의 변경이 끝난 뒤 원래 ID로 다시 조회해 행 삭제, 삭제 필드의 null, 정적 치환 값, 보존 필드의 비변경을 확인한다. subject 컬럼을 치환해도 검증에서 사라진 행으로 오인하지 않는다. 필드 쓰기로 안정적인 ID나 tenant 컬럼을 변경할 수 없다.
+
+Prisma가 반환하는 DateTime·Decimal·BigInt는 JSON 정책에 적은 치환 값과 저장된 scalar 값으로 비교한다. DateTime은 밀리초까지 정확한 ISO 시각 문자열, Decimal은 유한한 숫자 또는 10진 문자열, BigInt는 안전한 정수 숫자 또는 10진 정수 문자열을 사용할 수 있다. 큰 정수·고정밀 소수는 문자열로 적어 정밀도를 보존한다. 이 비교는 P2 배치 삭제에도 적용하며, 보존 필드와 일반 문자열·숫자는 타입까지 엄격하게 비교한다.
 
 `allowUnverified: true`는 기존 custom executor를 이전하는 동안의 명시적인 호환 옵션이다. 검증 누락은 `unverified`로 표시하며 검증 성공으로 표시하지 않는다. 영구 실행 경로에는 이 옵션을 사용할 수 없다. 누락을 허용하더라도 실제로 감지한 검증 실패를 무시하지 않는다.
 

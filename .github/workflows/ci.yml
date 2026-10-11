@@ -42,6 +42,8 @@ jobs:
         run: npm run lint
 
       - name: Test
+        env:
+          DATA_SUBJECT_HTTP_FIXTURE: "1"
         run: npm test -- --runInBand
 
       - name: Build
@@ -79,3 +81,32 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:compatibility -- ${{ matrix.profile }}
+
+  composition:
+    name: Pinned nestarc composition (PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: data_subject
+          POSTGRES_PASSWORD: data_subject_test
+          POSTGRES_DB: data_subject
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U data_subject -d data_subject"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://data_subject:data_subject_test@localhost:5432/data_subject
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.11.1
+          cache: npm
+      - run: npm ci
+      - run: npm run test:composition

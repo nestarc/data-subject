@@ -12,6 +12,8 @@ Today the package ships:
 - in-memory request and artifact stores for tests and local development
 - signed read-only erasure previews, stable-ID field verification, and v2 evidence
 - optional PostgreSQL idempotency, transactional execution records, and resumable artifact/notification delivery
+- a PostgreSQL job queue with resumable pages, cancellation, and bounded NDJSON export
+- an optional Transcend erasure webhook adapter with separate local and provider status
 - a `data-subject lint` CLI for Prisma schema/policy checks
 - explicit export field allowlists and tenant-scoped request/artifact access
 - failure-stage metadata that distinguishes committed data from delivery failures
@@ -19,7 +21,7 @@ Today the package ships:
 
 ## Current Scope
 
-Package version: `0.2.0`. The working tree includes unreleased P0/P1 contract changes; the migration notes below apply to this source build, not the published 0.2.0 tarball.
+Package version: `0.2.0`. The working tree includes unreleased P0/P1/P2 changes; the migration notes below apply to this source build, not the published 0.2.0 tarball.
 
 This repository focuses on the execution core plus the minimum production trust layer. It does **not** currently ship:
 
@@ -27,7 +29,8 @@ This repository focuses on the execution core plus the minimum production trust 
 - a core cloud-storage dependency; a private S3 reference implementation is provided separately
 - direct Stripe, Intercom, analytics, or support-tool connectors
 - an admin or end-user portal
-- automatic relation discovery/deletion, distributed transactions, or streaming exports
+- automatic relation discovery/deletion or distributed transactions
+- streaming ZIP archives; the separate paged export path streams NDJSON chunks
 
 If you need database-specific behavior, you can plug in your own `EntityExecutor`, `RequestStorage`, or `ArtifactStorage`.
 
@@ -46,6 +49,8 @@ Peer dependencies used by this package:
 - `@prisma/client` if you use `fromPrisma(...)`
 
 See the [verified compatibility matrix](docs/compatibility.md), [P0 migration guide](docs/p0-migration.md), and [P1 setup/migration guide](docs/p1-migration.md) for tested versions and API changes.
+
+The [P2 execution guide](docs/p2-execution.md) covers job migrations, batch boundaries, resumable NDJSON, cancellation, and retention. The [Transcend guide](docs/platform-integration.md) describes the optional erasure connector; [nestarc composition](docs/nestarc-composition.md) records the pinned integration and its transaction boundaries. These additions have synthetic verification; live provider accounts and customer workload validation remain separate.
 
 ## Quick Start
 
@@ -222,6 +227,8 @@ This prevents `retain` fields from being dropped just because some other fields 
 
 `exportFields` is separate from erase `fields`. Omitted or empty lists exclude the entity entirely. Newly added columns, password hashes, and tokens are excluded unless explicitly listed. Selecting a JSON/object field includes its nested content; review those values separately.
 
+BigInt values are exported as exact decimal strings, including inside nested values. Dates use ISO strings through JSON serialization. Consumers should preserve decimal strings when values can exceed JavaScript's safe integer range.
+
 Current export artifact shape:
 
 - key: `data-subject/{tenantId}/{requestId}/export.zip`
@@ -304,7 +311,7 @@ The package includes a small Prisma schema linter:
 npx @nestarc/data-subject lint --schema prisma/schema.prisma --config data-subject.config.json
 ```
 
-Use `definePolicy()` once and consume the same definitions in `Registry.registerDefinition()` and the lint config. Shared definitions enable strict scalar coverage and declared relation checks by default: new fields need a policy or an exclusion reason; required-field null writes, unsafe parent deletion, retained-child conflicts, missing dependencies, and cycles fail validation. The parser supports a documented Prisma subset; also run `prisma validate`. See the [shared-policy example](docs/p1-migration.md).
+Use `definePolicy()` once and consume the same definitions in `Registry.registerDefinition()` and the lint config. Shared definitions enable strict scalar coverage and declared relation checks by default: new fields need a policy or an exclusion reason; required-field null writes, unsafe parent deletion or reference-key updates, retained-child conflicts, missing dependencies, and cycles fail validation. The parser supports a documented Prisma subset; also run `prisma validate`. See the [shared-policy example](docs/p1-migration.md).
 
 ## Events and Hooks
 

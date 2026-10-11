@@ -1,0 +1,200 @@
+import 'reflect-metadata';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { Pool } from 'pg';
+import { Test } from '@nestjs/testing';
+import JSZip from 'jszip';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { AuditService, getAuditTableStatements } from '@nestarc/audit-log';
+import { TenancyService } from '@nestarc/tenancy';
+import { OutboxEmitter } from '@nestarc/outbox';
+import { DataSubjectService, InMemoryArtifactStorage, Registry, definePolicy, fromPrisma, type PrismaDelegate } from '@nestarc/data-subject';
+import { PrismaClient } from './generated/client/client';
+import { createComposition } from './composition';
+
+const schema = process.env.COMPOSITION_SCHEMA!;
+assert.match(schema, /^ds_composition_[a-f0-9]{32}$/);
+const role = schema.replace('ds_composition_', 'ds_c_');
+const password = `${role}_fixture_only`;
+const adminUrl = process.env.DATABASE_URL!;
+const admin = new Pool({ connectionString: adminUrl, options: `-c search_path=${schema}` });
+const appUrl = new URL(adminUrl);
+appUrl.username = role;
+appUrl.password = password;
+const db = new PrismaClient({ adapter: new PrismaPg({
+  connectionString: appUrl.toString(), options: `-c search_path=${schema}`,
+}, { schema }) });
+const principal = { actorId: 'verified-operator', tenantIds: ['tenant-a', 'tenant-b'] };
+let eraseCalls = 0;
+
+function registry(client: () => { profile: PrismaDelegate }, failAfterErase = false): Registry {
+  const delegate = new Proxy({} as PrismaDelegate, {
+    get(_target, key) {
+      const current = client().profile;
+      const value = Reflect.get(current, key);
+      return typeof value === 'function' ? value.bind(current) : value;
+    },
+  });
+  const executor = fromPrisma({ delegate, subjectField: 'subjectId', tenantField: 'tenantId' });
+  const erase = executor.erase!;
+  executor.erase = async (...args) => {
+    eraseCalls += 1;
+    const result = await erase(...args);
+    if (failAfterErase) throw new Error('injected rollback');
+    return result;
+  };
+  const policies = new Registry();
+  policies.registerDefinition(definePolicy([{
+    entityName: 'Profile', subjectField: 'subjectId', stableIdField: 'id',
+    scope: { mode: 'multi-tenant', tenantField: 'tenantId' }, rowLevel: 'delete-row',
+    fields: { email: 'delete', passwordHash: 'delete', accessToken: 'delete' },
+    exportFields: ['id', 'email'],
+  }])[0], executor);
+  return policies;
+}
+
+function composition(failAfterErase = false) {
+  return createComposition({ prisma: db, schemaName: schema,
+    registry: client => registry(client, failAfterErase),
+    artifactStorage: new InMemoryArtifactStorage(), previewSigningKey: 'composition-only-32-byte-signing-key',
+  });
+}
+
+async function seed(subjectId: string): Promise<void> {
+  for (const tenantId of ['tenant-a', 'tenant-b']) {
+    await admin.query(`INSERT INTO "Profile" (id, "tenantId", "subjectId", email, "passwordHash", "accessToken") VALUES ($1,$2,$3,$4,$5,$6)`,
+      [`${subjectId}-${tenantId}`, tenantId, subjectId, `${tenantId}@example.test`, 'private-password-hash', 'private-token']);
+  }
+}
+async function count(table: string, requestId: string): Promise<number> {
+  const column = table === 'outbox_events' ? 'aggregate_id' : 'target_id';
+  return Number((await admin.query(`SELECT count(*) AS count FROM ${table} WHERE ${column} = $1`, [requestId])).rows[0].count);
+}
+async function main(): Promise<void> {
+  let module: Awaited<ReturnType<ReturnType<typeof Test.createTestingModule>['compile']>> | undefined;
+  let roleCreated = false;
+  try {
+    await admin.query(fs.readFileSync(require.resolve('@nestarc/outbox/src/sql/create-outbox-table.sql'), 'utf8'));
+    for (const sql of getAuditTableStatements({ tableName: `${schema}.audit_logs` })) await admin.query(sql);
+    await admin.query(fs.readFileSync('delivery-receipts.sql', 'utf8'));
+    // This role cannot bypass RLS and does not own any of the application tables.
+    await admin.query(`CREATE ROLE "${role}" LOGIN PASSWORD '${password}' NOSUPERUSER NOBYPASSRLS`);
+    roleCreated = true;
+    await admin.query(`GRANT USAGE ON SCHEMA "${schema}" TO "${role}"`);
+    await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO "${role}"`);
+    for (const [table, tenantColumn] of [
+      ['Profile', 'tenantId'], ['DataSubjectRequest', 'tenantId'], ['DataSubjectExecution', 'tenantId'],
+      ['audit_logs', 'tenant_id'], ['outbox_events', 'tenant_id'],
+    ]) {
+      await admin.query(`ALTER TABLE "${table}" ENABLE ROW LEVEL SECURITY`);
+      await admin.query(`CREATE POLICY tenant_policy ON "${table}" USING ("${tenantColumn}" = current_setting('app.current_tenant', true)) WITH CHECK ("${tenantColumn}" = current_setting('app.current_tenant', true))`);
+    }
+    const c = composition();
+    module = await Test.createTestingModule({ providers: [
+      { provide: DataSubjectService, useValue: c.service },
+      { provide: TenancyService, useValue: c.tenancy },
+      { provide: AuditService, useValue: c.audit },
+      { provide: OutboxEmitter, useValue: c.outbox },
+    ] }).compile();
+    await module.init();
+    assert.equal(module.get(DataSubjectService), c.service);
+    const roles = await db.$queryRaw<Array<{ rolsuper: boolean; rolbypassrls: boolean }>>`
+      SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user`;
+    assert.deepEqual(roles, [{ rolsuper: false, rolbypassrls: false }]);
+    assert.equal(await db.profile.count(), 0, 'raw application client without context sees no tenant rows');
+    await assert.rejects(c.service.getRequest('absent', 'tenant-a'));
+    assert.throws(() => c.runForTenant({ actorId: 'outsider', tenantIds: ['tenant-b'] }, 'tenant-a', async () => undefined), /access denied/);
+    await seed('same-subject');
+    await c.runForTenant(principal, 'tenant-a', async () => {
+      const preview = await c.service.previewErase('same-subject', 'tenant-a');
+      assert.equal(preview.plan.entities[0].expectedRows, 1);
+      assert.equal((await admin.query('SELECT count(*) FROM "DataSubjectRequest"')).rows[0].count, '0');
+      const result = await c.service.erase('same-subject', 'tenant-a', { requestKey: 'same-key', requestedBy: principal.actorId, preview });
+      assert.equal(result.state, 'completed');
+      assert.equal(result.stats?.lifecycle?.notificationFailures, undefined);
+      assert.equal(await count('outbox_events', result.id), 3);
+      assert.equal(await count('audit_logs', result.id), 3);
+      assert.equal((await admin.query('SELECT count(*) FROM "Profile" WHERE "tenantId" = $1', ['tenant-b'])).rows[0].count, '1');
+      const eventRows = (await admin.query('SELECT tenant_id, payload, idempotency_key FROM outbox_events WHERE aggregate_id = $1', [result.id])).rows;
+      assert.ok(eventRows.every(row => row.tenant_id === 'tenant-a' && row.idempotency_key === row.payload.notificationId));
+      assert.ok(eventRows.every(row => !('subjectId' in row.payload) && !('artifactUrl' in row.payload)));
+      const audits = (await admin.query('SELECT tenant_id, actor_id, metadata FROM audit_logs WHERE target_id = $1', [result.id])).rows;
+      assert.ok(audits.every(row => row.tenant_id === 'tenant-a' && row.actor_id === principal.actorId && row.metadata.notificationId));
+      const before = eraseCalls;
+      const replay = await c.service.erase('same-subject', 'tenant-a', { requestKey: 'same-key', requestedBy: principal.actorId, preview });
+      assert.equal(replay.id, result.id);
+      await c.service.retryCompletion(result.id, 'tenant-a');
+      assert.equal(eraseCalls, before);
+      assert.equal(await count('outbox_events', result.id), 3);
+      await c.runForTenant(principal, 'tenant-b', async () => {
+        await assert.rejects(c.service.getRequest(result.id, 'tenant-a'));
+        const own = await c.service.erase('same-subject', 'tenant-b', { requestKey: 'same-key' });
+        assert.notEqual(own.id, result.id);
+        assert.equal(own.state, 'completed');
+      });
+    });
+    await seed('retry-subject');
+    const originalEmit = c.outbox.emit.bind(c.outbox);
+    let failOnce = true;
+    c.outbox.emit = async (...args) => {
+      await originalEmit(...args);
+      if (failOnce) { failOnce = false; throw new Error('injected after outbox insert'); }
+    };
+    await c.runForTenant(principal, 'tenant-a', async () => {
+      const result = await c.service.erase('retry-subject', 'tenant-a', { requestKey: 'retry-key' });
+      assert.equal(result.state, 'completed');
+      assert.equal(result.stats?.lifecycle?.notificationFailures?.length, 1);
+      assert.equal(await count('outbox_events', result.id), 2, 'savepoint undoes insertion before failed callback');
+      const before = eraseCalls;
+      const recovered = await c.service.retryCompletion(result.id, 'tenant-a');
+      assert.equal(recovered.stats?.lifecycle?.notificationFailures, undefined);
+      assert.equal(eraseCalls, before);
+      assert.equal(await count('outbox_events', result.id), 3);
+      assert.equal(await count('audit_logs', result.id), 3);
+      await c.service.retryCompletion(result.id, 'tenant-a');
+      assert.equal(await count('outbox_events', result.id), 3);
+      // Exercise receipt deduplication directly by replaying persisted IDs.
+      const execution = (await admin.query('SELECT record FROM "DataSubjectExecution" WHERE "requestId"=$1', [result.id])).rows[0].record;
+      for (const notification of execution.notifications) notification.delivered = false;
+      await admin.query('UPDATE "DataSubjectExecution" SET record=$1::jsonb WHERE "requestId"=$2', [JSON.stringify(execution), result.id]);
+      await c.service.retryCompletion(result.id, 'tenant-a');
+      assert.equal(eraseCalls, before);
+      assert.equal(await count('outbox_events', result.id), 3);
+      assert.equal(await count('audit_logs', result.id), 3);
+    });
+    await seed('export-subject');
+    await c.runForTenant(principal, 'tenant-a', async () => {
+      const exported = await c.service.export('export-subject', 'tenant-a', { requestKey: 'export-key' });
+      assert.equal(exported.state, 'completed');
+      const artifact = await c.service.getArtifact(exported.id, 'tenant-a');
+      assert.ok(artifact);
+      const zip = await JSZip.loadAsync(artifact.body);
+      const rows = JSON.parse(await zip.file('Profile.json')!.async('string'));
+      assert.deepEqual(rows, [{ id: 'export-subject-tenant-a', email: 'tenant-a@example.test' }]);
+      assert.equal(await count('outbox_events', exported.id), 2);
+      assert.equal(await count('audit_logs', exported.id), 3);
+      const replay = await c.service.export('export-subject', 'tenant-a', { requestKey: 'export-key' });
+      assert.equal(replay.id, exported.id);
+      assert.equal(await count('outbox_events', exported.id), 2);
+    });
+    await seed('rollback-subject');
+    const failing = composition(true);
+    await failing.runForTenant(principal, 'tenant-a', async () => {
+      const result = await failing.service.erase('rollback-subject', 'tenant-a', { requestKey: 'rollback' });
+      assert.equal(result.state, 'failed');
+      assert.equal((await admin.query('SELECT count(*) FROM "Profile" WHERE "subjectId"=$1 AND "tenantId"=$2', ['rollback-subject', 'tenant-a'])).rows[0].count, '1');
+      assert.equal((await admin.query('SELECT count(*) FROM outbox_events WHERE aggregate_id=$1 AND event_type=$2', [result.id, 'data_subject.request_completed'])).rows[0].count, '0');
+    });
+    assert.equal(await db.profile.count(), 0, 'transaction-local tenant context does not leak through pooled connections');
+    console.log('PASS Nestarc composition: exact published packages, strict types, Nest providers, PostgreSQL RLS, export/erase tenant isolation, lifecycle audit/outbox, callback rollback/retry/deduplication, data rollback');
+  } finally {
+    await module?.close();
+    await db.$disconnect();
+    if (roleCreated) {
+      await admin.query(`DROP OWNED BY "${role}"`);
+      await admin.query(`DROP ROLE "${role}"`);
+    }
+    await admin.end();
+  }
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });

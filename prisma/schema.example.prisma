@@ -44,3 +44,44 @@ model DataSubjectExecution {
 
   @@unique([tenantId, type, idempotencyKey])
 }
+
+// Optional P2 jobs. Apply p2-jobs.sql for database CHECK constraints and partial
+// queue/expiry indexes; Prisma cannot express all of those migration details.
+model DataSubjectJob {
+  id                  String   @id
+  tenantId            String
+  kind                String
+  idempotencyKey      String
+  payloadHash         String
+  payload             Json
+  state               String   @default("queued")
+  checkpoint          Json     @default("null")
+  result              Json     @default("null")
+  processedRows       BigInt   @default(0)
+  pagesCommitted      Int      @default(0)
+  chunksWritten       Int      @default(0)
+  attempts            Int      @default(0)
+  revision            Int      @default(0)
+  hasCommittedChanges Boolean  @default(false)
+  lastError           String?
+  createdAt           DateTime @default(now()) @db.Timestamptz
+  updatedAt           DateTime @default(now()) @db.Timestamptz
+  availableAt         DateTime @default(now()) @db.Timestamptz
+  completedAt         DateTime? @db.Timestamptz
+  chunksDeletedAt     DateTime? @db.Timestamptz
+  expiresAt           DateTime @default(dbgenerated("clock_timestamp() + interval '7 days'")) @db.Timestamptz
+  purgedAt            DateTime? @db.Timestamptz
+  chunks              DataSubjectJobChunk[]
+
+  @@unique([tenantId, kind, idempotencyKey], map: "DataSubjectJob_tenant_kind_key")
+}
+
+model DataSubjectJobChunk {
+  jobId    String
+  tenantId String
+  index    Int
+  body     Bytes
+  job      DataSubjectJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@id([jobId, index])
+}

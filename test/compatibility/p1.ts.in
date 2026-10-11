@@ -19,7 +19,7 @@ import {
 } from '@nestarc/data-subject';
 import { db } from './client';
 
-type TransactionDelegates = Pick<typeof db, 'profile' | 'invoice' | 'graphAccount' | 'graphSession'>;
+type TransactionDelegates = Pick<typeof db, 'profile' | 'invoice' | 'graphAccount' | 'graphSession' | 'compositeParent' | 'compositeChild'>;
 const transactionContext = new AsyncLocalStorage<TransactionDelegates>();
 function delegate<K extends keyof TransactionDelegates>(name: K): TransactionDelegates[K] {
   return new Proxy(db[name], {
@@ -374,6 +374,52 @@ async function testRelationOrder() {
   console.log('PASS: declared child-before-parent ordering satisfies actual PostgreSQL RESTRICT foreign keys and tenant isolation');
 }
 
+async function testRelationLintRegressions() {
+  const schema = readFileSync(path.join(process.cwd(), 'schema.prisma'), 'utf8');
+  const fixtures = ['Profile', 'Invoice', 'GraphAccount', 'GraphSession', 'BatchItem', 'ScalarItem', 'CompositeParent', 'CompositeChild', 'CascadeParent', 'CascadeChild', 'DataSubjectRequest', 'DataSubjectExecution'];
+  const composite = definePolicy([
+    { entityName: 'CompositeParent', subjectField: 'subjectId', stableIdField: 'id', scope: { mode: 'multi-tenant', tenantField: 'tenantId' }, rowLevel: 'delete-row', fields: { email: 'delete' }, relations: ['children'] },
+    { entityName: 'CompositeChild', subjectField: 'subjectId', stableIdField: 'id', scope: { mode: 'multi-tenant', tenantField: 'tenantId' }, fields: { parentId: 'delete', total: { strategy: 'retain', legalBasis: 'GDPR Art. 17(3)(b)' } }, relations: ['parent'], dependsOn: ['CompositeParent'] },
+  ]);
+  const compositeReport = lintPrismaSchema(schema, { definitions: composite, strictCoverage: true, suppressions: fixtures.filter((model) => !['CompositeParent', 'CompositeChild'].includes(model)).map((model) => ({ model, reason: 'Independent compatibility fixture' })) });
+  assert.equal(compositeReport.ok, true, JSON.stringify(compositeReport.findings));
+  for (const tenantId of ['tenant-a', 'tenant-b']) {
+    await db.compositeParent.create({ data: { id: `composite-parent-${tenantId}`, tenantId, subjectId: 'composite-subject', email: `${tenantId}@example.test` } });
+    await db.compositeChild.create({ data: { id: `composite-child-${tenantId}`, tenantId, subjectId: 'composite-subject', parentId: `composite-parent-${tenantId}`, total: 42 } });
+  }
+  const setup = makeService({ registrations: [
+    { policy: composite[0], executor: fromPrisma({ delegate: delegate('compositeParent'), subjectField: 'subjectId', tenantField: 'tenantId' }) },
+    { policy: composite[1], executor: fromPrisma({ delegate: delegate('compositeChild'), subjectField: 'subjectId', tenantField: 'tenantId' }) },
+  ] });
+  const request = await setup.service.erase('composite-subject', 'tenant-a', { requestKey: 'composite-detach' });
+  assert.equal(request.state, 'completed', request.failureReason ?? undefined);
+  assert.equal(await db.compositeParent.count({ where: { tenantId: 'tenant-a' } }), 0);
+  const retained = await db.compositeChild.findUniqueOrThrow({ where: { id: 'composite-child-tenant-a' } });
+  assert.equal(retained.parentId, null);
+  assert.equal(retained.tenantId, 'tenant-a');
+  assert.equal(retained.total, 42);
+  assert.equal(await db.compositeParent.count({ where: { tenantId: 'tenant-b' } }), 1);
+  assert.equal((await db.compositeChild.findUniqueOrThrow({ where: { id: 'composite-child-tenant-b' } })).parentId, 'composite-parent-tenant-b');
+
+  const cascade = definePolicy([
+    { entityName: 'CascadeParent', subjectField: 'subjectId', stableIdField: 'id', scope: { mode: 'multi-tenant', tenantField: 'tenantId' }, fields: { email: { strategy: 'anonymize', replacement: 'anonymous@example.test' } }, relations: ['children'] },
+    { entityName: 'CascadeChild', subjectField: 'subjectId', stableIdField: 'id', scope: { mode: 'multi-tenant', tenantField: 'tenantId' }, fields: { ownerEmail: { strategy: 'retain', legalBasis: 'GDPR Art. 17(3)(b)' }, total: { strategy: 'retain', legalBasis: 'GDPR Art. 17(3)(b)' } }, relations: ['parent'], dependsOn: ['CascadeParent'] },
+  ]);
+  await db.cascadeParent.create({ data: { id: 'cascade-parent', tenantId: 'tenant-a', subjectId: 'cascade-subject', email: 'retained-owner@example.test' } });
+  await db.cascadeChild.create({ data: { id: 'cascade-child', tenantId: 'tenant-a', subjectId: 'cascade-subject', ownerEmail: 'retained-owner@example.test', total: 42 } });
+  const cascadeReport = lintPrismaSchema(schema, { definitions: cascade, strictCoverage: true, suppressions: fixtures.filter((model) => !['CascadeParent', 'CascadeChild'].includes(model)).map((model) => ({ model, reason: 'Independent compatibility fixture' })) });
+  assert.equal(cascadeReport.ok, false);
+  assert.ok(cascadeReport.findings.some((finding) => finding.code === 'dsr_lint_retention_conflict'), JSON.stringify(cascadeReport.findings));
+  assert.equal((await db.cascadeChild.findUniqueOrThrow({ where: { id: 'cascade-child' } })).ownerEmail, 'retained-owner@example.test', 'lint blocks the unsafe policy before an erasure runs');
+  await assert.rejects(db.$transaction(async (tx) => {
+    await tx.cascadeParent.update({ where: { id: 'cascade-parent' }, data: { email: 'anonymous@example.test' } });
+    assert.equal((await tx.cascadeChild.findUniqueOrThrow({ where: { id: 'cascade-child' } })).ownerEmail, 'anonymous@example.test', 'the real PostgreSQL foreign key cascades the retained value');
+    throw new Error('rollback cascade demonstration');
+  }), /rollback cascade demonstration/);
+  assert.equal((await db.cascadeChild.findUniqueOrThrow({ where: { id: 'cascade-child' } })).ownerEmail, 'retained-owner@example.test');
+  console.log('PASS: strict lint accepts nullable composite-FK detachment with a required tenant key, and blocks ON UPDATE CASCADE mutation of retained child fields');
+}
+
 function testPolicyLint() {
   const scalarSchema = `model Account {
     id String @id
@@ -429,6 +475,7 @@ export async function runP1() {
   await testPreview();
   await testFieldVerification();
   await testRelationOrder();
+  await testRelationLintRegressions();
   await testDurableExecution();
   await testDurableExpiry();
   await testProcessInterruption();

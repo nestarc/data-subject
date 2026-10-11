@@ -1,5 +1,5 @@
 import type { Registry } from './registry';
-import type { DataSubjectLintFinding } from './lint/types';
+import type { DataSubjectLintFinding, DataSubjectLintSuppression } from './lint/types';
 import { lintPrismaSchema } from './lint/lint';
 import type { RegisteredEntity } from './types';
 
@@ -8,6 +8,8 @@ export interface RegistryValidationOptions {
   /** Schema validation requires every entity to use registerDefinition. */
   schemaSource?: string;
   strictCoverage?: boolean;
+  /** Explicit reviewed exclusions; relation checks still inspect the full schema. */
+  suppressions?: DataSubjectLintSuppression[];
 }
 
 export interface RegistryValidationReport {
@@ -91,6 +93,7 @@ export function validateRegistry(
         definitions,
         strictCoverage: opts.strictCoverage ?? true,
         requireTenantField: opts.requireTenantField,
+        suppressions: opts.suppressions,
       }).findings,
     );
   }

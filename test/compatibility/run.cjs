@@ -37,8 +37,8 @@ try {
     fs.writeFileSync(path.join(cwd, 'client.ts'), modern
       ? 'import { PrismaClient } from "./generated/client/client";\nimport { PrismaPg } from "@prisma/adapter-pg";\nconst connectionString = process.env.DATABASE_URL!;\nexport const db = new PrismaClient({ adapter: new PrismaPg({ connectionString }, { schema: new URL(connectionString).searchParams.get("schema")! }) });\n'
       : 'import { PrismaClient } from "@prisma/client";\nexport const db = new PrismaClient();\n');
-    for (const file of ['smoke', 'p1']) fs.copyFileSync(path.join(__dirname, `${file}.ts.in`), path.join(cwd, `${file}.ts`));
-    fs.writeFileSync(path.join(cwd, 'tsconfig.json'), JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'Node16', moduleResolution: 'Node16', esModuleInterop: true, strict: true, skipLibCheck: true, outDir: 'build', experimentalDecorators: true, emitDecoratorMetadata: true }, include: ['smoke.ts', 'p1.ts', 'client.ts', 'generated/**/*.ts'] }));
+    for (const file of ['smoke', 'p1', 'p2']) fs.copyFileSync(path.join(__dirname, `${file}.ts.in`), path.join(cwd, `${file}.ts`));
+    fs.writeFileSync(path.join(cwd, 'tsconfig.json'), JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'Node16', moduleResolution: 'Node16', esModuleInterop: true, strict: true, skipLibCheck: true, outDir: 'build', experimentalDecorators: true, emitDecoratorMetadata: true }, include: ['smoke.ts', 'p1.ts', 'p2.ts', 'client.ts', 'generated/**/*.ts'] }));
     console.log(`\nChecking ${name} from ${packed[0].filename}`);
     run('npm', ['ci', '--no-audit', '--no-fund'], cwd, fixtureEnv);
     run('npm', ['install', '--save=false', '--package-lock=false', '--strict-peer-deps', '--no-audit', '--no-fund', tarball], cwd, fixtureEnv);
@@ -53,6 +53,13 @@ try {
         cwd,
         env: { ...env, ...fixtureEnv },
         input: `DROP TABLE "${schemaName}"."DataSubjectExecution";\nSET search_path TO "${schemaName}";\n${migration}`,
+        stdio: ['pipe', 'inherit', 'inherit'],
+      });
+      const jobsMigration = fs.readFileSync(path.join(cwd, 'node_modules/@nestarc/data-subject/prisma/p2-jobs.sql'), 'utf8');
+      execFileSync(prisma, ['db', 'execute', '--stdin'], {
+        cwd,
+        env: { ...env, ...fixtureEnv },
+        input: `SET search_path TO "${schemaName}";\n${jobsMigration}`,
         stdio: ['pipe', 'inherit', 'inherit'],
       });
       run(path.join(cwd, 'node_modules/.bin/tsc'), ['--project', 'tsconfig.json'], cwd, fixtureEnv);

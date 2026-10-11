@@ -82,6 +82,47 @@ describe('ExportRunner', () => {
     expect(result.artifactHash).toBe(expected);
   });
 
+  it('preserves allowlisted BigInt values as decimal strings throughout the ZIP payload', async () => {
+    const registry = new Registry();
+    registry.register({
+      policy: {
+        entityName: 'Account', subjectField: 'subjectId',
+        fields: { balance: 'delete', secret: 'delete' },
+        exportFields: ['id', 'balance', 'details', 'createdAt'],
+      },
+      executor: fromPrisma({
+        subjectField: 'subjectId', tenantField: 'tenantId',
+        delegate: {
+          findMany: async () => [{
+            id: 9007199254740993n,
+            subjectId: 'subject', tenantId: 'tenant',
+            balance: -9007199254740995n,
+            details: { values: [0n, { count: 18446744073709551615n }], regularNumber: 42 },
+            createdAt: new Date('2026-10-11T00:00:00.000Z'),
+            secret: 99999999999999999999n,
+          }],
+          deleteMany: async () => ({ count: 0 }),
+          updateMany: async () => ({ count: 0 }),
+        },
+      }),
+    });
+    const artifacts = new InMemoryArtifactStorage();
+    const result = await new ExportRunner(registry, artifacts).run('request', 'subject', 'tenant');
+    const stored = await artifacts.get(exportArtifactKey('tenant', 'request'));
+    const zip = await JSZip.loadAsync(stored!.body);
+    const text = await zip.file('Account.json')!.async('string');
+
+    expect(JSON.parse(text)).toEqual([{
+      id: '9007199254740993',
+      balance: '-9007199254740995',
+      details: { values: ['0', { count: '18446744073709551615' }], regularNumber: 42 },
+      createdAt: '2026-10-11T00:00:00.000Z',
+    }]);
+    expect(text).not.toMatch(/secret|99999999999999999999|subjectId|tenantId/);
+    expect(result.artifactHash).toBe(createHash('sha256').update(stored!.body).digest('hex'));
+    expect(result.stats.entities).toEqual([{ entityName: 'Account', affected: 1, strategy: 'export' }]);
+  });
+
   it('exports only own allowlisted fields, excluding secrets even when erasure policy includes them', async () => {
     const registry = new Registry();
     const row = Object.assign(Object.create({ inherited: 'hidden' }), {

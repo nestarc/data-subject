@@ -53,7 +53,14 @@ export class ExportRunner {
             .map((field) => [field, row[field]]),
         ),
       );
-      zip.file(`${entry.policy.entityName}.json`, JSON.stringify(projected, null, 2));
+      zip.file(
+        `${entry.policy.entityName}.json`,
+        JSON.stringify(
+          projected,
+          (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value,
+          2,
+        ),
+      );
       entities.push({
         entityName: entry.policy.entityName,
         affected: rows.length,

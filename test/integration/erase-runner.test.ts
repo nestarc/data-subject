@@ -1,7 +1,8 @@
+import { Decimal } from '@prisma/client/runtime/library';
 import { DataSubjectError, DataSubjectErrorCode } from '../../src/errors';
 import { EraseRunner, ErasureVerificationError } from '../../src/erase-runner';
 import { Registry } from '../../src/registry';
-import type { EntityExecutor, ErasePlan } from '../../src/types';
+import type { EntityExecutor, ErasePlan, PolicyEntry } from '../../src/types';
 
 function makeExec(initial: Record<string, unknown>[]): {
   executor: EntityExecutor;
@@ -44,6 +45,66 @@ function makeExec(initial: Record<string, unknown>[]): {
 }
 
 describe('EraseRunner', () => {
+  describe('Prisma scalar replacement verification', () => {
+    function scalarRun(initial: unknown, stored: unknown, policy: PolicyEntry) {
+      const registry = new Registry();
+      const item = makeExec([{ id: 'i1', email: 'private@example.com', value: initial }]);
+      item.executor.anonymize = async (_subjectId, _tenantId, replacements) => {
+        item.state.rows[0] = { ...item.state.rows[0], ...replacements, value: stored };
+        return 1;
+      };
+      registry.register({
+        policy: { entityName: 'Item', subjectField: 'subjectId', fields: { email: 'delete', value: policy } },
+        executor: item.executor,
+      });
+      return new EraseRunner(registry).run('subject_1', 'tenant_1');
+    }
+
+    const conversions = [
+      { label: 'ISO DateTime', replacement: '2000-01-01T00:00:00.000Z', original: new Date('1999-01-01T00:00:00Z'), stored: new Date('2000-01-01T00:00:00Z') },
+      { label: 'DateTime with timezone offset', replacement: '2000-01-01T09:00:00+09:00', original: new Date('1999-01-01T00:00:00Z'), stored: new Date('2000-01-01T00:00:00Z') },
+      { label: 'BigInt integer string', replacement: '9007199254740993', original: 1n, stored: 9007199254740993n },
+      { label: 'BigInt safe integer number', replacement: 42, original: 1n, stored: 42n },
+      { label: 'Decimal numeric string', replacement: '123.4500', original: new Decimal('1'), stored: new Decimal('123.45') },
+      { label: 'Decimal number', replacement: 0.1, original: new Decimal('1'), stored: new Decimal('0.1') },
+      { label: 'Decimal beyond Number precision', replacement: '9007199254740993.0100', original: new Decimal('1'), stored: new Decimal('9007199254740993.01') },
+    ];
+    describe.each([false, true])('initially null: %s', initiallyNull => {
+      it.each(conversions)('verifies converted $label', async ({ replacement, original, stored }) => {
+        const result = await scalarRun(initiallyNull ? null : original, stored, { strategy: 'anonymize', replacement });
+        expect(result.stats.verificationResidual).toEqual([]);
+        expect(result.actions[0].verification).toMatchObject({
+          status: 'verified', checkedRows: 1,
+          fields: expect.arrayContaining([{ field: 'value', strategy: 'anonymize', checked: 1, status: 'verified' }]),
+        });
+      });
+    });
+
+    it.each([
+      { label: 'wrong DateTime instant', replacement: '2000-01-01T00:00:00Z', stored: new Date('2000-01-01T00:00:01Z') },
+      { label: 'non-ISO date coercion', replacement: 'January 1, 2000', stored: new Date('2000-01-01T00:00:00Z') },
+      { label: 'wrong BigInt', replacement: '9007199254740993', stored: 9007199254740992n },
+      { label: 'unsafe BigInt number', replacement: Number.MAX_SAFE_INTEGER + 1, stored: BigInt(Number.MAX_SAFE_INTEGER + 1) },
+      { label: 'rounded Decimal string', replacement: '9007199254740993.01', stored: new Decimal('9007199254740993') },
+      { label: 'imprecise Decimal number', replacement: 0.1, stored: new Decimal('0.10000000000000000001') },
+      { label: 'unconverted numeric string', replacement: 42, stored: '42' },
+    ])('rejects $label', async ({ replacement, stored }) => {
+      await expect(scalarRun(null, stored, { strategy: 'anonymize', replacement })).rejects.toMatchObject({
+        code: DataSubjectErrorCode.VerificationFailed,
+      });
+    });
+
+    it.each([
+      { label: 'DateTime', original: new Date('2000-01-01T00:00:00Z'), stored: '2000-01-01T00:00:00.000Z' },
+      { label: 'BigInt', original: 42n, stored: '42' },
+      { label: 'Decimal', original: new Decimal('123.45'), stored: '123.45' },
+    ])('keeps retained $label comparisons type-sensitive', async ({ original, stored }) => {
+      await expect(scalarRun(original, stored, { strategy: 'retain', legalBasis: 'tax:law' })).rejects.toMatchObject({
+        code: DataSubjectErrorCode.VerificationFailed,
+      });
+    });
+  });
+
   it('deletes matching rows and records stats', async () => {
     const registry = new Registry();
     const user = makeExec([{ id: 'u1', email: 'a@b.com' }]);

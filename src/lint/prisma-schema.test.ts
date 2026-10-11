@@ -69,6 +69,7 @@ describe('parsePrismaSchema', () => {
       fields: ['tenantId', 'userId'],
       references: ['tenantId', 'id'],
       onDelete: 'Restrict',
+      onUpdate: 'Cascade',
     });
   });
 

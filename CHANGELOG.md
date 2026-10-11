@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- ZIP exports serialize BigInt values as exact decimal strings, including nested allowlisted values.
+- Both erase runners verify Prisma DateTime, Decimal, and BigInt replacements against their stored scalar values while retaining strict comparison for retained fields.
+- Relation lint accepts composite foreign-key detachment when one nullable component is cleared, and detects retained-child conflicts when a parent reference key changes through `onUpdate`.
+- The compiled CLI loads `.mjs` policy configurations with native ES module imports, including top-level await and paths containing spaces.
+- Private S3 download links use a fixed signing timestamp and are withheld if their validity expires while signing.
+
+### P2
+
+- Transcend erasure webhook adapter with pinned ES384 verification, trusted tenant/subject mapping, encrypted callback nonces, durable job submission, and separate local/provider outcomes.
+- Optional PostgreSQL job queue with bounded transactions, atomic page checkpoints, concurrent workers, retry limits, cancellation, partial completion, and expiring private chunks.
+- Paged Prisma erasure and allowlisted NDJSON export for independent models, using stable keyset cursors and bounded high-water marks. Previously committed batches remain committed after cancellation or later failure.
+- Pinned nestarc tenancy/audit-log/outbox composition example and consumer validation, with durable delivery receipts rather than assuming an outbox metadata key enforces uniqueness.
+- Synthetic workload and failure fixtures, deployment guidance, and a support proposal that separates tested technical scope from unvalidated customer adoption and pricing hypotheses.
+
 ### P1
 
 - Signed, read-only erasure previews with expiry and in-transaction policy/scope revalidation.

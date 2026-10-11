@@ -61,7 +61,7 @@ const signedUrl = await downloads.link(requestId, actor, 60); // null when expir
 
 `getRequest(requestId, tenantId)` 조회 후 tenant·subject·완료 상태·artifact hash·파일 종류별 권한을 확인한다. 증빙 다운로드에는 별도의 `evidence:download` 권한이 필요하다. 파일 키는 검증한 요청에서 재구성하며 클라이언트가 보낸 키와 저장된 `artifactUrl`을 신뢰하지 않는다. 권한이 없는 요청에는 호스트 라우트에서 일반적인 404 응답을 사용하고 상세 오류나 요청 존재 여부를 노출하지 않는다. HTTP 프록시로 바이트를 전달할 때 `Cache-Control: no-store`, 다운로드 전용 `Content-Disposition`을 설정한다.
 
-서명 링크는 발급 후 소유한 사람이 사용할 수 있는 bearer credential이다. 링크 생성 시 인증을 거쳐도 링크 공유를 막을 수는 없다. 기본 유효시간은 60초이며 객체의 남은 보존기간보다 길게 발급하지 않는다. 이미 발급된 링크의 즉시 회수·요청마다 다시 인증이 필요하면 링크 대신 `download()`를 통한 서버 전달을 사용한다. IAM session 종료로 링크가 더 일찍 만료될 수도 있다. [AWS presigned URL](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)
+서명 링크는 발급 후 소유한 사람이 사용할 수 있는 bearer credential이다. 링크 생성 시 인증을 거쳐도 링크 공유를 막을 수는 없다. 기본 유효시간은 60초이며 객체의 남은 보존기간보다 길게 발급하지 않는다. 서명 시작 시각을 고정해 자격 증명 조회 등 비동기 지연이 만료 시각을 늘리지 않도록 하고, 서명이 끝났을 때 링크가 이미 만료됐다면 반환하지 않는다. 이미 발급된 링크의 즉시 회수·요청마다 다시 인증이 필요하면 링크 대신 `download()`를 통한 서버 전달을 사용한다. IAM session 종료로 링크가 더 일찍 만료될 수도 있다. [AWS presigned URL](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html)
 
 ## 실패 업로드와 재시도
 

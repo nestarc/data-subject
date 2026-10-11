@@ -69,7 +69,7 @@ class FakeS3 implements S3Transport {
     if (!object || object.ETag !== input.IfMatch) throw new Error('precondition failed');
     this.objects.delete(input.Key);
   }
-  async signGet(input: Parameters<S3Transport['signGet']>[0], seconds: number) {
+  async signGet(input: Parameters<S3Transport['signGet']>[0], seconds: number, _signingDate: Date) {
     this.signs.push({ key: input.Key, seconds });
     return `https://signed.invalid/${input.Key}?expires=${seconds}`;
   }
@@ -270,6 +270,7 @@ describe('authenticated artifact delivery', () => {
 
 describe('AWS SDK v3 command bridge', () => {
   type Command = { operation: string; input: Record<string, unknown> };
+  type SigningOptions = { expiresIn: number; signingDate: Date };
   const sdk = Object.fromEntries([
     'GetPublicAccessBlock', 'GetBucketOwnershipControls', 'GetBucketVersioning',
     'PutObject', 'HeadObject', 'GetObject', 'ListObjectsV2', 'DeleteObject',
@@ -278,7 +279,7 @@ describe('AWS SDK v3 command bridge', () => {
     constructor(readonly input: Record<string, unknown>) {}
   }]));
   const { createAwsS3Transport } = createRequire(__filename)('../../examples/private-artifacts/aws-sdk-v3.cjs') as {
-    createAwsS3Transport(options: { sdk: typeof sdk; client: { send: (command: Command) => Promise<unknown> }; getSignedUrl: (client: unknown, command: Command, options: { expiresIn: number }) => Promise<string> }): S3Transport;
+    createAwsS3Transport(options: { sdk: typeof sdk; client: { send: (command: Command) => Promise<unknown> }; getSignedUrl: (client: unknown, command: Command, options: SigningOptions) => Promise<string> }): S3Transport;
   };
 
   it('maps real S3 command shapes, streams, headers, and signing options', async () => {
@@ -299,8 +300,43 @@ describe('AWS SDK v3 command bridge', () => {
     await expect(transport.get({ Bucket: 'bucket', Key: 'key', IfMatch: 'etag' })).resolves.toMatchObject({ body });
     await expect(transport.list({ Bucket: 'bucket', Prefix: 'prefix/' })).resolves.toEqual({ keys: ['key-a'], nextToken: 'next' });
     await transport.delete({ Bucket: 'bucket', Key: 'key', IfMatch: 'etag' });
-    await transport.signGet({ Bucket: 'bucket', Key: 'key' }, 30);
+    const signingDate = new Date('2026-10-11T00:00:00Z');
+    await transport.signGet({ Bucket: 'bucket', Key: 'key' }, 30, signingDate);
     expect(sent.find((command) => command.operation === 'DeleteObject')!.input.IfMatch).toBe('etag');
-    expect(getSignedUrl).toHaveBeenCalledWith(client, expect.objectContaining({ operation: 'GetObject' }), { expiresIn: 30 });
+    expect(getSignedUrl).toHaveBeenCalledWith(client, expect.objectContaining({ operation: 'GetObject' }), { expiresIn: 30, signingDate });
+  });
+
+  it.each([
+    { name: 'caps delayed signing to retention with fractional seconds', remainingMs: 60_750, seconds: 300, delayMs: 10_000, expectedTtl: 60, available: true },
+    { name: 'preserves a shorter requested lifetime during signing delay', remainingMs: 120_750, seconds: 30, delayMs: 10_000, expectedTtl: 30, available: true },
+    { name: 'withholds a link when signing finishes after artifact expiry', remainingMs: 1_000, seconds: 60, delayMs: 10_000, expectedTtl: 1, available: false },
+    { name: 'withholds a link when its shorter lifetime expires during signing', remainingMs: 120_000, seconds: 1, delayMs: 2_000, expectedTtl: 1, available: false },
+  ])('$name', async ({ remainingMs, seconds, delayMs, expectedTtl, available }) => {
+    const { storage, transport, advance } = fixture();
+    await storage.put(exportKey, body, 'application/zip');
+    const artifactExpiresAt = Number(transport.puts[0].Metadata['expires-at']);
+    advance(DAY - remainingMs);
+    const startedAt = artifactExpiresAt - remainingMs;
+    let signedExpiresAt = 0;
+    const getSignedUrl = jest.fn(async (_client: unknown, _command: Command, options: SigningOptions) => {
+      // Credential/endpoint resolution can finish well after signDownload starts.
+      await Promise.resolve();
+      advance(delayMs);
+      const signingDate = options.signingDate ?? new Date(startedAt + delayMs);
+      signedExpiresAt = Math.floor(signingDate.getTime() / 1000) * 1000 + options.expiresIn * 1000;
+      return `https://signed.invalid/?expiresAt=${signedExpiresAt}`;
+    });
+    const client = { send: async () => ({}) };
+    transport.signGet = createAwsS3Transport({ client, sdk, getSignedUrl }).signGet;
+
+    const url = await storage.signDownload(exportKey, seconds);
+    expect(getSignedUrl).toHaveBeenCalledWith(client, expect.objectContaining({ operation: 'GetObject' }), {
+      expiresIn: expectedTtl,
+      signingDate: new Date(Math.floor(startedAt / 1000) * 1000),
+    });
+    expect(signedExpiresAt).toBeLessThanOrEqual(artifactExpiresAt);
+    expect(signedExpiresAt).toBeLessThanOrEqual(startedAt + seconds * 1000);
+    if (available) expect(url).toBe(`https://signed.invalid/?expiresAt=${signedExpiresAt}`);
+    else expect(url).toBeNull();
   });
 });

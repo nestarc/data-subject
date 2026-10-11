@@ -66,3 +66,44 @@ export type {
   PrismaExecutionClient,
   PrismaExecutionTransactionClient,
 } from './storage/prisma-execution-store';
+
+export { PostgresJobStore } from './jobs/postgres-job-store';
+export type {
+  PostgresJobClient,
+  PostgresJobTransactionClient,
+  PostgresJobStoreOptions,
+} from './jobs/postgres-job-store';
+export type {
+  DurableJobStore,
+  JobJson,
+  JobSubmitInput,
+  JobRecord,
+  JobStepResult,
+  JobTransaction,
+  JobHandler,
+  JobFilter,
+} from './jobs/types';
+export {
+  TRANSCEND_ERASURE_JOB,
+  TranscendErasureAdapter,
+  TranscendIntegrationError,
+} from './integrations/transcend';
+export type {
+  TranscendBinding,
+  TranscendAdapterOptions,
+  TranscendHttpRequest,
+} from './integrations/transcend';
+export {
+  PAGED_PRIVACY_JOB_KIND,
+  createPagedPrivacyHandler,
+  createPagedPrivacyPayload,
+} from './jobs/paged-privacy';
+export type {
+  PagedId,
+  PagedReadInput,
+  PagedEntityExecutor,
+  PagedPrivacyPayload,
+  PagedPrivacyOptions,
+} from './jobs/paged-privacy';
+export { pagedFromPrisma } from './prisma/paged-from-prisma';
+export type { PagedPrismaDelegate, PagedFromPrismaOptions } from './prisma/paged-from-prisma';

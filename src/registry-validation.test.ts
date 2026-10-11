@@ -2,6 +2,34 @@ import { Registry } from './registry';
 import { validateRegistry } from './registry-validation';
 
 describe('validateRegistry', () => {
+  it('requires reviewed exclusions when checking a full schema with operational models', () => {
+    const registry = new Registry();
+    registry.registerDefinition({
+      entityName: 'Profile', subjectField: 'subjectId', stableIdField: 'id',
+      scope: { mode: 'multi-tenant', tenantField: 'tenantId' }, fields: { email: 'delete' },
+    }, {
+      scope: { mode: 'multi-tenant', tenantField: 'tenantId' }, identityField: 'id',
+      select: async () => [], erase: async () => 0, anonymize: async () => 0,
+    });
+    const schemaSource = `model Profile {
+      id String @id
+      subjectId String
+      tenantId String
+      email String?
+    }
+    model DataSubjectJob {
+      id String @id
+      payload Json
+    }`;
+    expect(validateRegistry(registry, { schemaSource }).ok).toBe(false);
+    expect(validateRegistry(registry, {
+      schemaSource, suppressions: [{ model: 'DataSubjectJob', reason: 'Operational queue has its own expiry and cleanup' }],
+    }).ok).toBe(true);
+    expect(validateRegistry(registry, {
+      schemaSource, suppressions: [{ model: 'DataSubjectJob', reason: '' }],
+    }).ok).toBe(false);
+  });
+
   it('uses shared definitions to validate schema drift', () => {
     const registry = new Registry();
     registry.registerDefinition(

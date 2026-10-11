@@ -39,7 +39,11 @@
     "docs/compatibility.md",
     "docs/p0-migration.md",
     "docs/p1-migration.md",
-    "docs/private-artifacts.md"
+    "docs/private-artifacts.md",
+    "docs/p2-execution.md",
+    "docs/platform-integration.md",
+    "docs/nestarc-composition.md",
+    "docs/p2-support-proposal.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -49,7 +53,8 @@
     "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\"",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "prepublishOnly": "npm run build",
-    "test:compatibility": "node test/compatibility/run.cjs"
+    "test:compatibility": "node test/compatibility/run.cjs",
+    "test:composition": "node test/composition/run.cjs"
   },
   "dependencies": {
     "jszip": "^3.10.1"

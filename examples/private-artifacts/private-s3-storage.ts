@@ -146,9 +146,16 @@ export class PrivateS3ArtifactStorage implements ArtifactStorage {
     if (!head) return null;
     const metadata = inspectMetadata(head);
     assertExpectedHash(metadata.hash, expectedHash);
-    const remaining = Math.floor((metadata.expiresAt - this.now()) / 1000);
+    const signingTime = this.now();
+    const remaining = Math.floor((metadata.expiresAt - signingTime) / 1000);
     if (remaining < 1) return null;
-    return this.options.transport.signGet(input, Math.min(seconds, remaining));
+    // SigV4 dates have second precision. Pin that date before credential resolution
+    // so asynchronous signing cannot move the URL's absolute expiration forward.
+    const signingDate = new Date(Math.floor(signingTime / 1000) * 1000);
+    const expiresIn = Math.min(seconds, remaining);
+    const expiresAt = signingDate.getTime() + expiresIn * 1000;
+    const url = await this.options.transport.signGet(input, expiresIn, signingDate);
+    return this.now() < expiresAt ? url : null;
   }
 
   /**

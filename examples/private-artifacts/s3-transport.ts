@@ -27,5 +27,6 @@ export interface S3Transport {
     nextToken?: string;
   }>;
   delete(input: S3ObjectInput & { IfMatch: string }): Promise<void>;
-  signGet(input: S3ObjectInput, expiresIn: number): Promise<string>;
+  /** Expiry is relative to this fixed signing date, never to when async signing finishes. */
+  signGet(input: S3ObjectInput, expiresIn: number, signingDate: Date): Promise<string>;
 }

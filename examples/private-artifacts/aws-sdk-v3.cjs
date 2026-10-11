@@ -42,8 +42,8 @@ function createAwsS3Transport({ client, sdk, getSignedUrl }) {
       };
     },
     async delete(input) { await send(sdk.DeleteObjectCommand, input); },
-    signGet(input, expiresIn) {
-      return getSignedUrl(client, new sdk.GetObjectCommand(input), { expiresIn });
+    signGet(input, expiresIn, signingDate) {
+      return getSignedUrl(client, new sdk.GetObjectCommand(input), { expiresIn, signingDate });
     },
   };
 }

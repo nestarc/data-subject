@@ -2,6 +2,7 @@ import { DataSubjectError, DataSubjectErrorCode } from './errors';
 import { captureErasureSnapshot, fingerprint, hashRegistryPolicy, type EntitySnapshot, type ErasurePlanSummary } from './erasure-plan';
 import type { Registry } from './registry';
 import { stableStringify } from './stable-json';
+import { matchesReplacement } from './value-verification';
 import type { EntityVerification, ErasureEvidenceAction, RequestStats, Strategy } from './types';
 
 export interface EraseResult {
@@ -145,8 +146,10 @@ function verifyEntity(snapshot: EntitySnapshot, after: Record<string, unknown>[]
       fields.forEach(field => failedFields.add(field));
     } else {
       for (const field of fields) {
-        const expected = strategy(field) === 'retain' ? before.fields[field] : fingerprint(outcome.updateMap[field]);
-        if (!Object.hasOwn(row, field) || fingerprint(row[field]) !== expected) {
+        const matches = strategy(field) === 'retain'
+          ? fingerprint(row[field]) === before.fields[field]
+          : matchesReplacement(row[field], outcome.updateMap[field]);
+        if (!Object.hasOwn(row, field) || !matches) {
           failed.add(before.identity);
           failedFields.add(field);
         }

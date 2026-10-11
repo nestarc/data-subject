@@ -1,0 +1,604 @@
+import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { execFileSync } from 'node:child_process';
+import { generateKeyPairSync, randomBytes, sign } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import {
+  PostgresJobStore, Registry, definePolicy, fromPrisma, pagedFromPrisma,
+  createPagedPrivacyPayload, createPagedPrivacyHandler, PAGED_PRIVACY_JOB_KIND,
+  DataSubjectService, PrismaExecutionStore, InMemoryArtifactStorage,
+  TranscendErasureAdapter, TRANSCEND_ERASURE_JOB,
+  type JobHandler, type JobRecord, type PagedEntityExecutor,
+} from '@nestarc/data-subject';
+import { db } from './client';
+
+type BusinessTransaction = Pick<typeof db, 'batchItem' | 'scalarItem'>;
+const transactionContext = new AsyncLocalStorage<BusinessTransaction>();
+const batchDelegate = new Proxy(db.batchItem, {
+  get(_target, key) {
+    const target = (transactionContext.getStore() ?? db).batchItem;
+    const value = Reflect.get(target, key);
+    return typeof value === 'function' ? value.bind(target) : value;
+  },
+});
+const scalarDelegate = new Proxy(db.scalarItem, {
+  get(_target, key) {
+    const target = (transactionContext.getStore() ?? db).scalarItem;
+    const value = Reflect.get(target, key);
+    return typeof value === 'function' ? value.bind(target) : value;
+  },
+});
+
+function makeStore(options: { maxAttempts?: number; retryDelayMs?: number; maxChunkBytes?: number; retentionMs?: number } = {}) {
+  return new PostgresJobStore({
+    client: db,
+    bindTransaction: (tx, work) => transactionContext.run(tx, work),
+    schemaName: new URL(process.env.DATABASE_URL!).searchParams.get('schema')!,
+    transactionOptions: { maxWait: 20000, timeout: 20000 },
+    ...options,
+  });
+}
+
+async function seed(subjectId: string, count: number) {
+  for (const tenantId of ['tenant-a', 'tenant-b']) {
+    await db.batchItem.createMany({ data: Array.from({ length: count }, (_, index) => ({
+      id: `${subjectId}-${tenantId}-${String(index).padStart(6, '0')}`,
+      subjectId, tenantId, email: `person-${index}@example.test`, total: 42,
+      passwordHash: `secret-password-${index}`,
+    })) });
+  }
+}
+
+async function testQueueDeduplication() {
+  const store = makeStore();
+  const settled = await Promise.allSettled(Array.from({ length: 6 }, (_, index) => store.submit({
+    id: `p2-duplicate-${index}`, tenantId: 'tenant-a', kind: 'queue-duplicate',
+    idempotencyKey: 'same-key', payload: { subjectId: 'same-subject', version: 1 },
+  })));
+  const results = settled.map((result) => { if (result.status === 'rejected') throw result.reason; return result.value; });
+  assert.equal(results.filter((result) => result.created).length, 1);
+  assert.equal(new Set(results.map((result) => result.job.id)).size, 1);
+  await assert.rejects(store.submit({ id: 'p2-different-payload', tenantId: 'tenant-a', kind: 'queue-duplicate', idempotencyKey: 'same-key', payload: { subjectId: 'different-subject', version: 1 } }));
+  const anotherTenant = await store.submit({ id: 'p2-other-tenant', tenantId: 'tenant-b', kind: 'queue-duplicate', idempotencyKey: 'same-key', payload: { subjectId: 'same-subject', version: 1 } });
+  assert.equal(anotherTenant.created, true);
+  assert.equal(await store.get(results[0].job.id, 'tenant-b'), null);
+  await assert.rejects(store.cancel(results[0].job.id, 'tenant-b'));
+  console.log('PASS: packed PostgreSQL queue deduplicates concurrent submissions and enforces payload/tenant identity');
+}
+
+async function testSkipLocked() {
+  const store = makeStore();
+  for (const id of ['p2-lock-first', 'p2-lock-second']) {
+    await store.submit({ id, tenantId: 'tenant-a', kind: 'queue-skip-locked', idempotencyKey: id, payload: null });
+  }
+  let release!: () => void;
+  let entered!: () => void;
+  const hold = new Promise<void>((resolve) => { release = resolve; });
+  const enteredFirst = new Promise<void>((resolve) => { entered = resolve; });
+  const first = store.runNext(async ({ job }) => {
+    entered();
+    await hold;
+    return { done: true, checkpoint: { worker: 'first' }, processedRows: 0, result: { id: job.id } };
+  }, { kind: 'queue-skip-locked', tenantId: 'tenant-a' });
+  await enteredFirst;
+  let second: JobRecord | null = null;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    second = await Promise.race([
+      store.runNext(async ({ job }) => ({ done: true, checkpoint: { worker: 'second' }, processedRows: 0, result: { id: job.id } }), { kind: 'queue-skip-locked', tenantId: 'tenant-a' }),
+      new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => reject(new Error('Second worker blocked on the first row instead of skipping its lock')), 5000); }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    release();
+  }
+  const firstResult = await first;
+  assert.ok(firstResult && second);
+  assert.notEqual(firstResult.id, second.id);
+  assert.equal(firstResult.state, 'completed');
+  assert.equal(second.state, 'completed');
+  console.log('PASS: a second PostgreSQL worker skips a held row lock and completes another job');
+}
+
+const deleteBatch: JobHandler = async ({ job }) => {
+  assert.ok(job.payload && typeof job.payload === 'object' && !Array.isArray(job.payload));
+  assert.equal(typeof job.payload.subjectId, 'string');
+  const rows = await batchDelegate.findMany({ where: { tenantId: job.tenantId, subjectId: String(job.payload.subjectId) }, orderBy: { id: 'asc' }, take: 2 });
+  await batchDelegate.deleteMany({ where: { tenantId: job.tenantId, id: { in: rows.map((row) => row.id) } } });
+  return { done: rows.length < 2, checkpoint: { lastId: rows.at(-1)?.id ?? null }, processedRows: rows.length, hasCommittedChanges: rows.length > 0 };
+};
+
+async function testAtomicCheckpointAndCancel() {
+  await seed('p2-atomic', 5);
+  const store = makeStore({ maxAttempts: 1, retryDelayMs: 1 });
+  const { job } = await store.submit({ id: 'p2-atomic-job', tenantId: 'tenant-a', kind: 'queue-atomic', idempotencyKey: 'atomic', payload: { subjectId: 'p2-atomic' } });
+  const failed = await store.runNext(async (tx) => {
+    await deleteBatch(tx);
+    await tx.appendChunk(Buffer.from('must roll back with this page'));
+    throw new Error('private-person@example.test injected transaction failure');
+  }, { kind: 'queue-atomic', tenantId: 'tenant-a' });
+  assert.equal(failed?.state, 'failed');
+  assert.ok(!failed?.lastError?.includes('private-person'));
+  assert.equal(failed?.pagesCommitted, 0);
+  assert.equal(failed?.processedRows, 0);
+  assert.equal(failed?.chunksWritten, 0);
+  assert.equal(failed?.checkpoint, null);
+  assert.equal(await db.batchItem.count({ where: { tenantId: 'tenant-a', subjectId: 'p2-atomic' } }), 5);
+  const boundedStore = makeStore({ maxAttempts: 1, retryDelayMs: 1, maxChunkBytes: 8 });
+  await boundedStore.retry(job.id, 'tenant-a');
+  const chunkRejected = await boundedStore.runNext(async (tx) => {
+    const step = await deleteBatch(tx);
+    await tx.appendChunk(Buffer.alloc(9));
+    return step;
+  }, { kind: 'queue-atomic', tenantId: 'tenant-a' });
+  assert.equal(chunkRejected?.state, 'failed');
+  assert.equal(chunkRejected?.processedRows, 0);
+  assert.equal(chunkRejected?.chunksWritten, 0);
+  assert.equal(await db.batchItem.count({ where: { tenantId: 'tenant-a', subjectId: 'p2-atomic' } }), 5, 'chunk append failure rolls back business deletion');
+  await store.retry(job.id, 'tenant-a');
+  const firstPage = await store.runNext(deleteBatch, { kind: 'queue-atomic', tenantId: 'tenant-a' });
+  assert.equal(firstPage?.pagesCommitted, 1);
+  assert.equal(firstPage?.processedRows, 2);
+  const cancelled = await store.cancel(job.id, 'tenant-a');
+  assert.equal(cancelled.state, 'cancelled');
+  assert.equal(cancelled.partial, true);
+  assert.equal(await store.runNext(deleteBatch, { kind: 'queue-atomic', tenantId: 'tenant-a' }), null);
+  assert.deepEqual((await store.retry(job.id, 'tenant-a')).checkpoint, firstPage?.checkpoint);
+  let current: JobRecord | null = null;
+  for (let step = 0; step < 4; step++) {
+    current = await store.runNext(deleteBatch, { kind: 'queue-atomic', tenantId: 'tenant-a' });
+    if (current?.state === 'completed') break;
+  }
+  assert.equal(current?.state, 'completed');
+  assert.equal(current?.processedRows, 5);
+  assert.equal(await db.batchItem.count({ where: { tenantId: 'tenant-a', subjectId: 'p2-atomic' } }), 0);
+  assert.equal(await db.batchItem.count({ where: { tenantId: 'tenant-b', subjectId: 'p2-atomic' } }), 5);
+  console.log('PASS: checkpoint/chunk/business rollback, explicit retry and partial cancellation preserve committed page progress');
+}
+
+export async function interruptP2Worker(jobId: string) {
+  const store = makeStore();
+  await store.runNext(async (tx) => {
+    assert.equal(tx.job.id, jobId);
+    await deleteBatch(tx);
+    await tx.appendChunk(Buffer.from('uncommitted process interruption chunk'));
+    process.exit(79);
+  }, { kind: 'queue-crash', tenantId: 'tenant-a' });
+  throw new Error('Expected the child worker to exit during its uncommitted page');
+}
+
+async function testWorkerCrash() {
+  await seed('p2-worker-crash', 5);
+  const store = makeStore();
+  const { job } = await store.submit({ id: 'p2-worker-crash-job', tenantId: 'tenant-a', kind: 'queue-crash', idempotencyKey: 'crash', payload: { subjectId: 'p2-worker-crash' } });
+  await store.runNext(deleteBatch, { kind: 'queue-crash', tenantId: 'tenant-a' });
+  const before = await store.get(job.id, 'tenant-a');
+  assert.equal(before?.processedRows, 2);
+  try {
+    execFileSync(process.execPath, [path.join(__dirname, 'smoke.js'), '--p2-interrupt', job.id], { env: process.env, stdio: 'inherit' });
+    assert.fail('Expected abrupt process exit');
+  } catch (error) {
+    assert.ok(error !== null && typeof error === 'object' && 'status' in error);
+    assert.equal(error.status, 79);
+  }
+  const after = await store.get(job.id, 'tenant-a');
+  assert.equal(after?.state, 'queued');
+  assert.equal(after?.processedRows, before?.processedRows);
+  assert.equal(after?.pagesCommitted, before?.pagesCommitted);
+  assert.deepEqual(after?.checkpoint, before?.checkpoint);
+  assert.equal(after?.chunksWritten, 0);
+  assert.equal(await db.batchItem.count({ where: { tenantId: 'tenant-a', subjectId: 'p2-worker-crash' } }), 3);
+  const restarted = makeStore();
+  let finished: JobRecord | null = null;
+  for (let step = 0; step < 4; step++) {
+    finished = await restarted.runNext(deleteBatch, { kind: 'queue-crash', tenantId: 'tenant-a' });
+    if (finished?.state === 'completed') break;
+  }
+  assert.equal(finished?.state, 'completed');
+  assert.equal(finished?.processedRows, 5);
+  console.log('PASS: abrupt worker exit rolls back the active page, releases its PostgreSQL lock and resumes its committed checkpoint');
+}
+
+function pagedSetup(options: { noOp?: boolean; maxChunkBytes?: number } = {}) {
+  const registry = new Registry();
+  const [definition] = definePolicy([{
+    entityName: 'BatchItem', subjectField: 'subjectId', stableIdField: 'id',
+    scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
+    fields: { email: 'delete', passwordHash: 'delete', total: { strategy: 'retain', legalBasis: 'GDPR Art. 17(3)(b)' } },
+    exportFields: ['id', 'email', 'total'],
+  }]);
+  registry.registerDefinition(definition, fromPrisma({ delegate: batchDelegate, subjectField: 'subjectId', tenantField: 'tenantId' }));
+  const original = pagedFromPrisma({ delegate: batchDelegate, subjectField: 'subjectId', tenantField: 'tenantId' });
+  const measurements = { maximumRowsRead: 0, maximumLimit: 0, reads: 0, readFields: new Set<string>() };
+  const measured: PagedEntityExecutor = {
+    ...original,
+    async readPage(input) {
+      const rows = await original.readPage(input);
+      measurements.reads++;
+      measurements.maximumRowsRead = Math.max(measurements.maximumRowsRead, rows.length);
+      measurements.maximumLimit = Math.max(measurements.maximumLimit, input.limit);
+      for (const field of input.fields ?? []) measurements.readFields.add(field);
+      return rows;
+    },
+    ...(options.noOp ? { async updateByIds() { return 64; } } : {}),
+  };
+  const handler = createPagedPrivacyHandler({
+    registry, schemaSource: readFileSync(path.join(process.cwd(), 'schema.prisma'), 'utf8'),
+    excludedModels: {
+      Profile: 'Covered by the independent P0/P1 single-request fixture',
+      Invoice: 'Covered by the independent P0/P1 retention fixture',
+      GraphAccount: 'Relation fixture excluded from the independent-model batched path',
+      GraphSession: 'Relation fixture excluded from the independent-model batched path',
+      DataSubjectRequest: 'Privacy workflow metadata with a separate retention process',
+      DataSubjectExecution: 'Privacy workflow recovery metadata with a separate retention process',
+      ScalarItem: 'Covered separately by the Prisma scalar replacement regression',
+      CompositeParent: 'P1 composite relation fixture', CompositeChild: 'P1 composite relation fixture',
+      CascadeParent: 'P1 cascading update fixture', CascadeChild: 'P1 cascading update fixture',
+    },
+    executors: { BatchItem: measured }, batchSize: 64, maxChunkBytes: options.maxChunkBytes ?? 32768,
+  });
+  return { registry, handler, measurements };
+}
+
+async function finishPrivacyJob(store: ReturnType<typeof makeStore>, handler: JobHandler, jobId: string) {
+  for (let step = 0; step < 40; step++) {
+    const result = await store.runNext(handler, { kind: PAGED_PRIVACY_JOB_KIND, tenantId: 'tenant-a' });
+    assert.ok(result, 'expected the pending privacy job to be runnable');
+    assert.equal(result.id, jobId);
+    if (result.state === 'completed' || result.state === 'failed') return result;
+  }
+  throw new Error('Privacy job exceeded the bounded fixture page budget');
+}
+
+async function testPagedExportAndErase() {
+  await seed('p2-paged-export', 1025);
+  const setup = pagedSetup();
+  const store = makeStore({ maxChunkBytes: 32768 });
+  const { job } = await store.submit({ id: 'p2-paged-export-job', tenantId: 'tenant-a', kind: PAGED_PRIVACY_JOB_KIND, idempotencyKey: 'paged-export', payload: createPagedPrivacyPayload({ type: 'export', subjectId: 'p2-paged-export', registry: setup.registry }) });
+  const first = await store.runNext(setup.handler, { kind: PAGED_PRIVACY_JOB_KIND, tenantId: 'tenant-a' });
+  assert.equal(first?.processedRows, 64);
+  // This late row sorts above the saved high-water mark and is outside this job.
+  await db.batchItem.create({ data: { id: 'zz-late-export-row', tenantId: 'tenant-a', subjectId: 'p2-paged-export', email: 'late@example.test', total: 7, passwordHash: 'late-secret' } });
+  const exported = await finishPrivacyJob(store, setup.handler, job.id);
+  assert.equal(exported.state, 'completed');
+  assert.equal(exported.processedRows, 1025);
+  assert.equal(exported.hasCommittedChanges, false);
+  assert.equal(setup.measurements.maximumRowsRead, 64);
+  assert.equal(setup.measurements.maximumLimit, 64);
+  assert.ok(setup.measurements.reads >= 17);
+  assert.equal(setup.measurements.readFields.has('passwordHash'), false, 'export selects only the allowlist and required scope keys');
+  let rows = 0;
+  let maxChunkBytes = 0;
+  for await (const chunk of store.readChunks(job.id, 'tenant-a')) {
+    maxChunkBytes = Math.max(maxChunkBytes, chunk.body.length);
+    assert.ok(chunk.body.length <= 32768);
+    assert.ok(!chunk.body.toString().includes('secret-password'));
+    for (const line of chunk.body.toString().trim().split('\n')) {
+      const record = JSON.parse(line);
+      assert.equal(record.entityName, 'BatchItem');
+      assert.deepEqual(Object.keys(record.data).sort(), ['email', 'id', 'total']);
+      assert.ok(record.data.id.startsWith('p2-paged-export-tenant-a-'));
+      rows++;
+    }
+  }
+  assert.equal(rows, 1025);
+  await assert.rejects(store.readChunks(job.id, 'tenant-b')[Symbol.asyncIterator]().next());
+  await store.deleteChunks(job.id, 'tenant-a');
+  await assert.rejects(store.readChunks(job.id, 'tenant-a')[Symbol.asyncIterator]().next());
+  assert.equal(await db.batchItem.count({ where: { subjectId: 'p2-paged-export', tenantId: 'tenant-a' } }), 1026);
+
+  await seed('p2-paged-erase', 1025);
+  const erasure = pagedSetup();
+  const erasureJob = await store.submit({ id: 'p2-paged-erase-job', tenantId: 'tenant-a', kind: PAGED_PRIVACY_JOB_KIND, idempotencyKey: 'paged-erase', payload: createPagedPrivacyPayload({ type: 'erase', subjectId: 'p2-paged-erase', registry: erasure.registry }) });
+  const erased = await finishPrivacyJob(store, erasure.handler, erasureJob.job.id);
+  assert.equal(erased.state, 'completed');
+  assert.equal(erased.processedRows, 1025);
+  assert.equal(erased.hasCommittedChanges, true);
+  assert.equal(await db.batchItem.count({ where: { subjectId: 'p2-paged-erase', tenantId: 'tenant-a', email: null, passwordHash: null, total: 42 } }), 1025);
+  assert.equal(await db.batchItem.count({ where: { subjectId: 'p2-paged-erase', tenantId: 'tenant-b', email: { not: null }, passwordHash: { not: null } } }), 1025);
+  let verifiedRows = 0;
+  for await (const chunk of store.readChunks(erased.id, 'tenant-a')) {
+    assert.ok(!chunk.body.toString().includes('@example.test'));
+    assert.ok(!chunk.body.toString().includes('secret-password'));
+    const evidence = JSON.parse(chunk.body.toString());
+    assert.equal(evidence.schemaVersion, 'data-subject.paged-evidence.v1');
+    assert.equal(evidence.verification.status, 'verified');
+    verifiedRows += evidence.processedRows;
+  }
+  assert.equal(verifiedRows, 1025);
+  console.log(`PASS: 1,025-row export and erasure use at most ${setup.measurements.maximumRowsRead} rows/read and ${maxChunkBytes} bytes/chunk, preserve other tenant/retention, and honor the initial upper ID bound`);
+}
+
+async function testPagedFailureBoundaries() {
+  await seed('p2-paged-no-op', 65);
+  const store = makeStore({ maxAttempts: 1, retryDelayMs: 1, maxChunkBytes: 32768 });
+  const setup = pagedSetup({ noOp: true });
+  const { job } = await store.submit({ id: 'p2-paged-no-op-job', tenantId: 'tenant-a', kind: PAGED_PRIVACY_JOB_KIND, idempotencyKey: 'paged-no-op', payload: createPagedPrivacyPayload({ type: 'erase', subjectId: 'p2-paged-no-op', registry: setup.registry }) });
+  const failed = await store.runNext(setup.handler, { kind: PAGED_PRIVACY_JOB_KIND, tenantId: 'tenant-a' });
+  assert.equal(failed?.id, job.id);
+  assert.equal(failed?.state, 'failed');
+  assert.equal(failed?.lastError, 'dsr_verification_failed');
+  assert.equal(failed?.pagesCommitted, 0);
+  assert.equal(failed?.chunksWritten, 0);
+  assert.equal(await db.batchItem.count({ where: { subjectId: 'p2-paged-no-op', tenantId: 'tenant-a', email: { not: null } } }), 65);
+  await seed('p2-oversized-export', 1);
+  await db.batchItem.updateMany({ where: { subjectId: 'p2-oversized-export', tenantId: 'tenant-a' }, data: { email: 'x'.repeat(40000) } });
+  const bounded = pagedSetup({ maxChunkBytes: 32768 });
+  await store.submit({ id: 'p2-oversized-export-job', tenantId: 'tenant-a', kind: PAGED_PRIVACY_JOB_KIND, idempotencyKey: 'oversized-export', payload: createPagedPrivacyPayload({ type: 'export', subjectId: 'p2-oversized-export', registry: bounded.registry }) });
+  const tooLarge = await store.runNext(bounded.handler, { kind: PAGED_PRIVACY_JOB_KIND, tenantId: 'tenant-a' });
+  assert.equal(tooLarge?.state, 'failed');
+  assert.equal(tooLarge?.pagesCommitted, 0);
+  assert.equal(tooLarge?.chunksWritten, 0);
+  console.log('PASS: no-op erasure verification and oversized export chunks fail without committing a page or chunk');
+}
+
+async function testQueueExpiry() {
+  const store = makeStore({ retentionMs: 60000 });
+  const completedInput = { id: 'p2-expiry-completed', tenantId: 'tenant-a', kind: 'queue-expiry', idempotencyKey: 'expiry-completed', payload: { subjectId: 'private-expiry-subject' } };
+  const { job } = await store.submit(completedInput);
+  const lifetime = job.expiresAt.getTime() - job.createdAt.getTime();
+  assert.ok(lifetime >= 59900 && lifetime <= 60100);
+  await store.runNext(async ({ appendChunk }) => {
+    await appendChunk(Buffer.from('private-export-data'));
+    return { done: true, processedRows: 1, checkpoint: { privateCursor: 'row-1' }, result: { privateResult: true } };
+  }, { kind: 'queue-expiry', tenantId: 'tenant-a' });
+  await store.submit({ id: 'p2-expiry-queued', tenantId: 'tenant-a', kind: 'queue-expiry', idempotencyKey: 'expiry-queued', payload: { subjectId: 'private-queued-subject' } });
+  const schema = new URL(process.env.DATABASE_URL!).searchParams.get('schema')!;
+  assert.match(schema, /^[a-z0-9_]+$/);
+  // Seed 1,005 tiny fixture chunks without running 1,005 worker transactions.
+  // This crosses the cleanup SQL's 1,000-chunk transaction bound.
+  await db.$executeRawUnsafe(`INSERT INTO "${schema}"."DataSubjectJobChunk" ("jobId", "tenantId", "index", "body") SELECT $1, $2, i, decode('78', 'hex') FROM generate_series(1, 1004) AS i`, job.id, 'tenant-a');
+  await db.$executeRawUnsafe(`UPDATE "${schema}"."DataSubjectJob" SET "chunksWritten" = 1005 WHERE "id" = $1`, job.id);
+  async function remainingChunks() {
+    const rows = await db.$queryRawUnsafe<Array<{ count: bigint }>>(`SELECT COUNT(*) AS count FROM "${schema}"."DataSubjectJobChunk" WHERE "jobId" = $1`, job.id);
+    return rows[0].count;
+  }
+  assert.equal(await remainingChunks(), 1005n);
+  const streamingExport = store.readChunks(job.id, 'tenant-a')[Symbol.asyncIterator]();
+  const firstChunk = await streamingExport.next();
+  assert.equal(firstChunk.done, false);
+  assert.equal(firstChunk.value?.index, 0);
+  // Advance the two fixture deadlines in SQL rather than waiting on wall-clock time.
+  // The completed job expires first so the one-job sweep has a deterministic order.
+  await db.$executeRawUnsafe(`UPDATE "${schema}"."DataSubjectJob" SET "expiresAt" = CURRENT_TIMESTAMP - CASE WHEN "id" = $1 THEN INTERVAL '2 seconds' ELSE INTERVAL '1 second' END WHERE "id" IN ($1, $2)`, completedInput.id, 'p2-expiry-queued');
+  await assert.rejects(streamingExport.next(), { code: 'dsr_artifact_expired' });
+  await assert.rejects(store.readChunks(job.id, 'tenant-a')[Symbol.asyncIterator]().next());
+  await assert.rejects(store.retry('p2-expiry-queued', 'tenant-a'));
+  assert.equal(await store.purgeExpiredChunks(1), 1);
+  assert.equal(await remainingChunks(), 5n);
+  const partiallyPurged = await store.get(job.id, 'tenant-a');
+  assert.equal(partiallyPurged?.purgedAt, null);
+  assert.ok(partiallyPurged?.chunksDeletedAt);
+  assert.equal(partiallyPurged.payload, null);
+  assert.equal(partiallyPurged.checkpoint, null);
+  assert.equal(partiallyPurged.result, null);
+  assert.equal(await store.purgeExpiredChunks(1), 1);
+  assert.equal(await remainingChunks(), 0n);
+  assert.equal(await store.purgeExpiredChunks(1), 1);
+  assert.equal(await store.purgeExpiredChunks(1), 0);
+  for (const id of [job.id, 'p2-expiry-queued']) {
+    const cleared = await store.get(id, 'tenant-a');
+    assert.ok(cleared?.purgedAt);
+    assert.ok(cleared?.chunksDeletedAt);
+    assert.equal(cleared.payload, null);
+    assert.equal(cleared.checkpoint, null);
+    assert.equal(cleared.result, null);
+  }
+  const duplicate = await store.submit({ ...completedInput, id: 'p2-expiry-duplicate' });
+  assert.equal(duplicate.created, false);
+  assert.equal(duplicate.job.id, job.id);
+  assert.ok(duplicate.job.purgedAt, 'a repeated submission cannot recreate purged bytes');
+  assert.equal(await remainingChunks(), 0n);
+  console.log('PASS: expired queue chunks cannot be read or retried; 1,005-chunk cleanup deletes at most 1,000 per sweep, clears private JSON, and preserves deduplication');
+}
+
+async function testTranscendDurableBoundary() {
+  const subjectId = 'p2-provider-subject';
+  await seed(subjectId, 2);
+  const jobs = makeStore({ maxAttempts: 1, retryDelayMs: 1 });
+  const durableStore = new PrismaExecutionStore({
+    client: db,
+    bindTransaction: (tx, work) => transactionContext.run(tx, work),
+    executionSchemaName: new URL(process.env.DATABASE_URL!).searchParams.get('schema')!,
+    transactionOptions: { maxWait: 20000, timeout: 20000 },
+  });
+  let eraseCalls = 0;
+  const original = fromPrisma({ delegate: batchDelegate, subjectField: 'subjectId', tenantField: 'tenantId' });
+  const registry = new Registry();
+  registry.register({
+    policy: { entityName: 'BatchItem', subjectField: 'subjectId', stableIdField: 'id', rowLevel: 'delete-row', fields: { email: 'delete' } },
+    executor: { ...original, async erase(...args) { eraseCalls++; return original.erase(...args); } },
+  });
+  const service = new DataSubjectService({ registry, durableStore, requestStorage: durableStore.requests, artifactStorage: new InMemoryArtifactStorage(), slaDays: 30 });
+  const keys = generateKeyPairSync('ec', { namedCurve: 'secp384r1' });
+  const now = new Date();
+  const seconds = Math.floor(now.getTime() / 1000);
+  const secret = 'synthetic-webhook-secret-32-characters';
+  const nonce = 'synthetic-provider-nonce';
+  function jwt(audience = 'synthetic-audience') {
+    const header = Buffer.from(JSON.stringify({ alg: 'ES384', typ: 'JWT' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ scope: 'coreIdentifier', aud: audience, exp: seconds + 60, iat: seconds - 1 })).toString('base64url');
+    const signature = sign('sha384', Buffer.from(`${header}.${payload}`), { key: keys.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+    return `${header}.${payload}.${signature}`;
+  }
+  const input = {
+    body: Buffer.from(JSON.stringify({
+      type: 'ERASURE', coreIdentifier: { value: 'synthetic@example.invalid' },
+      dataSubject: { type: 'customer' }, isTest: false,
+      tenantId: 'tenant-b', subjectId: 'attacker-selected-subject',
+      extras: {
+        organization: { id: 'organization' }, dataSilo: { id: 'silo' },
+        request: { id: 'provider-request', link: 'http://169.254.169.254/private' },
+        profile: { id: 'profile', RequestDataSiloId: 'request-silo', identifier: 'synthetic@example.invalid', type: 'email' },
+      },
+    })),
+    headers: { 'x-sombra-token': jwt(), 'x-transcend-nonce': nonce, 'x-data-subject-webhook-secret': secret },
+  };
+  let resolutionCalls = 0;
+  let providerStatus = 503;
+  let providerCalls = 0;
+  const adapter = new TranscendErasureAdapter({
+    jobs, service, nonceEncryptionKey: randomBytes(32), clock: () => now,
+    bindings: [{
+      id: 'production', organizationId: 'organization', dataSiloId: 'silo', tenantId: 'tenant-a',
+      audience: 'synthetic-audience', publicKeys: [keys.publicKey.export({ format: 'pem', type: 'spki' }).toString()],
+      webhookSecret: secret, sombraOrigin: 'https://synthetic.sombra.example.invalid', apiKey: 'synthetic-api-key',
+      identifierType: 'email', dataSubjectType: 'customer',
+      async resolveSubject(identifier) { resolutionCalls++; assert.equal(identifier, 'synthetic@example.invalid'); return subjectId; },
+    }],
+    async http(request) {
+      providerCalls++;
+      assert.equal(request.url, 'https://synthetic.sombra.example.invalid/v1/data-silo');
+      assert.equal(request.method, 'PUT');
+      assert.equal(request.body, '{}');
+      assert.equal(request.redirect, 'error');
+      assert.equal(request.headers['x-transcend-nonce'], nonce);
+      assert.equal(request.headers.authorization, 'Bearer synthetic-api-key');
+      return { status: providerStatus };
+    },
+  });
+  await assert.rejects(adapter.receive({ ...input, headers: { ...input.headers, 'x-sombra-token': jwt('wrong-audience') } }));
+  await assert.rejects(adapter.receive({ ...input, headers: { ...input.headers, 'x-data-subject-webhook-secret': 'wrong-secret' } }));
+  assert.equal(resolutionCalls, 0);
+  const receipt = await adapter.receive(input);
+  assert.equal(receipt.created, true);
+  assert.equal(receipt.job.tenantId, 'tenant-a');
+  assert.ok(!JSON.stringify(receipt.job).includes(nonce));
+  assert.ok(!JSON.stringify(receipt.job).includes('synthetic-api-key'));
+  const filter = { kind: TRANSCEND_ERASURE_JOB, tenantId: 'tenant-a' };
+  const step: JobHandler = (tx) => adapter.processStep(tx);
+  const fenced = await jobs.runNext(step, filter);
+  assert.equal(fenced?.state, 'queued');
+  assert.equal(fenced?.hasCommittedChanges, true);
+  assert.equal(eraseCalls, 0);
+  assert.equal(providerCalls, 0);
+  assert.ok(fenced?.checkpoint && typeof fenced.checkpoint === 'object' && !Array.isArray(fenced.checkpoint));
+  assert.equal(fenced.checkpoint.phase, 'local_execution');
+  const failedOuter = await jobs.runNext(async (tx) => {
+    await adapter.processStep(tx);
+    // The service owns an independent transaction; root-client reads observe its commit.
+    assert.equal(await db.batchItem.count({ where: { tenantId: 'tenant-a', subjectId } }), 0);
+    throw new Error('injected queue checkpoint failure after durable local commit');
+  }, filter);
+  assert.equal(failedOuter?.state, 'failed');
+  assert.deepEqual(failedOuter?.checkpoint, fenced.checkpoint);
+  assert.equal(eraseCalls, 1);
+  assert.equal(await db.batchItem.count({ where: { tenantId: 'tenant-a', subjectId } }), 0);
+  assert.equal(await db.batchItem.count({ where: { tenantId: 'tenant-b', subjectId } }), 2);
+  const cancelled = await jobs.cancel(receipt.job.id, 'tenant-a');
+  assert.equal(cancelled.state, 'cancelled');
+  assert.equal(cancelled.partial, true, 'the committed fence survives queue rollback and requires reconciliation');
+  await jobs.retry(receipt.job.id, 'tenant-a');
+  const resumed = await jobs.runNext(step, filter);
+  assert.equal(resumed?.state, 'queued');
+  assert.ok(resumed?.checkpoint && typeof resumed.checkpoint === 'object' && !Array.isArray(resumed.checkpoint));
+  assert.equal(resumed.checkpoint.phase, 'callback');
+  assert.equal(eraseCalls, 1, 'replaying the signed fence reuses the original durable request');
+  const providerFailed = await jobs.runNext(step, filter);
+  assert.equal(providerFailed?.state, 'failed');
+  assert.deepEqual(providerFailed?.checkpoint, resumed.checkpoint);
+  assert.equal(providerCalls, 1);
+  await jobs.retry(receipt.job.id, 'tenant-a');
+  providerStatus = 200;
+  const completed = await jobs.runNext(step, filter);
+  assert.equal(completed?.state, 'completed');
+  assert.ok(completed?.result && typeof completed.result === 'object' && !Array.isArray(completed.result));
+  assert.equal(completed.result.localStatus, 'completed');
+  assert.equal(completed.result.providerStatus, 'accepted');
+  assert.equal(eraseCalls, 1);
+  assert.equal(providerCalls, 2);
+  assert.equal(await db.dataSubjectExecution.count({ where: { tenantId: 'tenant-a', type: 'erase', idempotencyKey: receipt.job.id } }), 1);
+  assert.equal(await jobs.get(receipt.job.id, 'tenant-b'), null);
+  const duplicate = await adapter.receive(input);
+  assert.equal(duplicate.created, false);
+  assert.equal(duplicate.job.id, receipt.job.id);
+  assert.equal(resolutionCalls, 1, 'receipt replay remains valid after local subject erasure');
+  console.log('PASS: authentic synthetic ES384 webhook binds the tenant; independent local commit survives queue rollback/cancel/retry and 503-to-200 callback retry without a second erasure');
+}
+
+async function testPrismaScalarReplacements() {
+  const registry = new Registry();
+  const [definition] = definePolicy([{
+    entityName: 'ScalarItem', subjectField: 'subjectId', stableIdField: 'id',
+    scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
+    fields: {
+      happenedAt: { strategy: 'anonymize', replacement: '2000-01-01T00:00:00.000Z' },
+      decimalNumber: { strategy: 'anonymize', replacement: 0 },
+      decimalString: { strategy: 'anonymize', replacement: '1.50' },
+      bigintNumber: { strategy: 'anonymize', replacement: 0 },
+      bigintString: { strategy: 'anonymize', replacement: '9007199254740993' },
+      retainedDecimal: { strategy: 'retain', legalBasis: 'GDPR Art. 17(3)(b)' },
+    },
+  }]);
+  registry.registerDefinition(definition, fromPrisma({ delegate: scalarDelegate, subjectField: 'subjectId', tenantField: 'tenantId' }));
+  const durableStore = new PrismaExecutionStore({
+    client: db, bindTransaction: (tx, work) => transactionContext.run(tx, work),
+    executionSchemaName: new URL(process.env.DATABASE_URL!).searchParams.get('schema')!,
+  });
+  const service = new DataSubjectService({ registry, durableStore, requestStorage: durableStore.requests, artifactStorage: new InMemoryArtifactStorage(), slaDays: 30 });
+  const handler = createPagedPrivacyHandler({
+    registry, schemaSource: readFileSync(path.join(process.cwd(), 'schema.prisma'), 'utf8'),
+    excludedModels: {
+      Profile: 'P0/P1 fixture', Invoice: 'P0/P1 fixture', GraphAccount: 'P1 relation fixture',
+      GraphSession: 'P1 relation fixture', BatchItem: 'P2 independent batch fixture',
+      DataSubjectRequest: 'Privacy workflow metadata', DataSubjectExecution: 'Privacy recovery metadata',
+      CompositeParent: 'P1 composite relation fixture', CompositeChild: 'P1 composite relation fixture',
+      CascadeParent: 'P1 cascading update fixture', CascadeChild: 'P1 cascading update fixture',
+    },
+    executors: { ScalarItem: pagedFromPrisma({ delegate: scalarDelegate, subjectField: 'subjectId', tenantField: 'tenantId' }) },
+    batchSize: 1,
+  });
+  for (const mode of ['durable', 'paged']) {
+    const subjectId = `p2-scalar-${mode}`;
+    for (const tenantId of ['tenant-a', 'tenant-b']) {
+      await db.scalarItem.createMany({ data: [false, true].map((nullable, index) => ({
+        id: `${subjectId}-${tenantId}-${index}`, tenantId, subjectId,
+        happenedAt: nullable ? null : new Date('2020-02-03T00:00:00.000Z'),
+        decimalNumber: nullable ? null : '12.75', decimalString: nullable ? null : '23.25',
+        bigintNumber: nullable ? null : 42n, bigintString: nullable ? null : 43n,
+        retainedDecimal: '99.25',
+      })) });
+    }
+    if (mode === 'durable') {
+      const result = await service.erase(subjectId, 'tenant-a', { requestKey: subjectId });
+      assert.equal(result.state, 'completed', result.failureReason ?? undefined);
+    } else {
+      const store = makeStore({ maxAttempts: 1 });
+      const { job } = await store.submit({ id: subjectId, tenantId: 'tenant-a', kind: PAGED_PRIVACY_JOB_KIND, idempotencyKey: subjectId, payload: createPagedPrivacyPayload({ type: 'erase', subjectId, registry }) });
+      const result = await finishPrivacyJob(store, handler, job.id);
+      assert.equal(result.state, 'completed', result.lastError ?? undefined);
+      assert.equal(result.processedRows, 2);
+    }
+    const rows = await db.scalarItem.findMany({ where: { subjectId, tenantId: 'tenant-a' } });
+    assert.equal(rows.length, 2);
+    for (const row of rows) {
+      assert.equal(row.happenedAt?.toISOString(), '2000-01-01T00:00:00.000Z');
+      assert.equal(row.decimalNumber?.toString(), '0');
+      assert.equal(row.decimalString?.toString(), '1.5');
+      assert.equal(row.bigintNumber, 0n);
+      assert.equal(row.bigintString, 9007199254740993n);
+      assert.equal(row.retainedDecimal?.toString(), '99.25');
+    }
+    const otherTenant = await db.scalarItem.findMany({ where: { subjectId, tenantId: 'tenant-b' }, orderBy: { id: 'asc' } });
+    assert.equal(otherTenant[0].happenedAt?.toISOString(), '2020-02-03T00:00:00.000Z');
+    assert.equal(otherTenant[0].decimalNumber?.toString(), '12.75');
+    assert.equal(otherTenant[0].bigintString, 43n);
+    assert.equal(otherTenant[1].happenedAt, null);
+    assert.equal(otherTenant[1].decimalNumber, null);
+    assert.equal(otherTenant[1].bigintString, null);
+  }
+  console.log('PASS: durable and paged erasure verify real Prisma DateTime, Decimal and BigInt static replacements from nullable/non-null rows, preserving retained values and another tenant');
+}
+
+export async function runP2() {
+  await testQueueDeduplication();
+  await testSkipLocked();
+  await testAtomicCheckpointAndCancel();
+  await testWorkerCrash();
+  await testPagedExportAndErase();
+  await testPagedFailureBoundaries();
+  await testQueueExpiry();
+  await testTranscendDurableBoundary();
+  await testPrismaScalarReplacements();
+}

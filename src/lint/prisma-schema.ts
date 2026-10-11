@@ -12,6 +12,7 @@ export interface PrismaSchemaField {
     fields: string[];
     references: string[];
     onDelete?: string;
+    onUpdate?: string;
     name?: string;
   };
   line: number;
@@ -222,7 +223,7 @@ function parseRelation(
     else if (key === 'onDelete' || key === 'onUpdate') {
       if (!referentialActions.has(value))
         fail(field.line, `Unsupported referential action ${value}`);
-      if (key === 'onDelete') relation.onDelete = value;
+      relation[key] = value;
     } else if (['name', 'map'].includes(key)) {
       if (!/^"(?:[^"\\]|\\.)*"$/.test(value)) fail(field.line, `Expected quoted relation ${key}`);
       let parsed: string;
