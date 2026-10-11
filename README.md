@@ -12,11 +12,13 @@ Today the package ships:
 - in-memory request and artifact stores for tests and local development
 - erase evidence artifacts with pre/post scan stats and SHA-256 hashes
 - a `data-subject lint` CLI for Prisma schema/policy checks
+- explicit export field allowlists and tenant-scoped request/artifact access
+- failure-stage metadata that distinguishes committed data from delivery failures
 - typed policy validation and typed runtime errors
 
 ## Current Scope
 
-Package version: `0.2.0`
+Package version: `0.2.0`. The working tree includes unreleased P0 contract changes; the migration notes below apply to this source build, not the published 0.2.0 tarball.
 
 This repository focuses on the execution core plus the minimum production trust layer. It does **not** currently ship:
 
@@ -42,7 +44,11 @@ Peer dependencies used by this package:
 - `rxjs`
 - `@prisma/client` if you use `fromPrisma(...)`
 
+See the [verified compatibility matrix](docs/compatibility.md) for exact tested versions and the [P0 migration guide](docs/p0-migration.md) for breaking API changes.
+
 ## Quick Start
+
+This example uses Prisma 5 client initialization. The compatibility guide includes the Prisma 7 generator and driver-adapter setup. Before exposing service calls over HTTP, connect authentication, authorization, and subject verification as shown in the [tenant-safe host example](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe).
 
 ```ts
 import { Module } from '@nestjs/common';
@@ -71,6 +77,7 @@ const artifactStorage = new InMemoryArtifactStorage(); // local/dev only; use pr
           policy: {
             entityName: 'User',
             subjectField: 'userId',
+            exportFields: ['email', 'name'],
             rowLevel: 'delete-row',
             fields: {
               email: 'delete',
@@ -87,6 +94,7 @@ const artifactStorage = new InMemoryArtifactStorage(); // local/dev only; use pr
           policy: {
             entityName: 'Invoice',
             subjectField: 'customerId',
+            exportFields: ['customerName', 'customerEmail', 'amount'],
             fields: {
               customerName: {
                 strategy: 'retain',
@@ -127,13 +135,18 @@ For tests and local development, `InMemoryRequestStorage` and `InMemoryArtifactS
 Usage:
 
 ```ts
-const exportRequest = await dataSubject.export('user_123', 'tenant_abc');
-const eraseRequest = await dataSubject.erase('user_123', 'tenant_abc');
+// IDs come from the host's authenticated, authorized, verified context.
+const exportRequest = await dataSubject.export('user_123', 'tenant_abc', { requestedBy: 'actor_123' });
+const eraseRequest = await dataSubject.erase('user_123', 'tenant_abc', { requestedBy: 'actor_123' });
 
-const sameRequest = await dataSubject.getRequest(exportRequest.id);
+const sameRequest = await dataSubject.getRequest(exportRequest.id, 'tenant_abc');
+// Also check sameRequest.subjectId against the authorized caller before download.
+const artifact = await dataSubject.getArtifact(exportRequest.id, 'tenant_abc');
 const tenantRequests = await dataSubject.listByTenant('tenant_abc');
-const overdue = await dataSubject.listOverdue();
+const overdue = await dataSubject.listOverdue(); // privileged background administration only
 ```
+
+Multi-tenant mode is the default: every executor must declare tenant scope, and `fromPrisma` requires a `tenantField`. A single-tenant installation must instead pass the same explicit `singleTenantId` to both `fromPrisma` and the service/module. Blank identifiers and mismatched scope are rejected before execution. Custom executors must actually enforce their declared filters.
 
 ## Policy Model
 
@@ -196,13 +209,15 @@ This prevents `retain` fields from being dropped just because some other fields 
 `DataSubjectService.export(subjectId, tenantId)` does the following:
 
 1. creates a request record
-2. reads matching rows from every registered entity
-3. writes one JSON file per entity into a ZIP archive
+2. reads matching rows only from entities with a nonempty `exportFields` allowlist
+3. projects only explicitly listed, own top-level fields into each entity JSON file in the ZIP
 4. stores the ZIP through `ArtifactStorage.put(...)`
 5. records:
    - `artifactHash` as a SHA-256 digest of the ZIP bytes
    - `artifactUrl` returned by the artifact storage
    - `stats.entities[]` with `strategy: 'export'`
+
+`exportFields` is separate from erase `fields`. Omitted or empty lists exclude the entity entirely. Newly added columns, password hashes, and tokens are excluded unless explicitly listed. Selecting a JSON/object field includes its nested content; review those values separately.
 
 Current export artifact shape:
 
@@ -219,7 +234,7 @@ Current export artifact shape:
 4. publishes `data_subject.erasure_requested`
 5. executes each registered entity according to its compiled policy
 6. performs a post-scan and residual verification
-7. stores an erase evidence JSON artifact through `ArtifactStorage.put(...)`
+7. after the transaction resolves, stores an erase evidence JSON artifact through `ArtifactStorage.put(...)`
 8. records:
    - `stats.entities[]`
    - `stats.retained[]`
@@ -243,6 +258,7 @@ Important details:
 - `requestStorage`
 - `artifactStorage`
 - `slaDays`
+- `singleTenantId` (explicit single-tenant mode; omit for multi-tenant)
 - `strictLegalBasis`
 - `entities`
 - `publishOutbox`
@@ -311,6 +327,9 @@ The package exposes `DataSubjectError` with stable error codes.
 
 Currently used codes include:
 
+- `dsr_invalid_input`
+- `dsr_invalid_scope`
+- `dsr_request_persistence_failed`
 - `dsr_invalid_policy`
 - `dsr_anonymize_dynamic_replacement`
 - `dsr_verification_failed`
@@ -334,13 +353,25 @@ new DataSubjectService({
 });
 ```
 
-Use it when your erase flow can run inside a real unit-of-work that also covers:
+The hook wraps erase data reads, mutations, verification, and `erasure_requested`. All executors must resolve their delegates against the same transaction client, and the hook must resolve only after commit. The [packed PostgreSQL fixture](https://github.com/nestarc/data-subject/blob/main/test/compatibility/smoke.ts.in) demonstrates this with `AsyncLocalStorage`.
 
-- the entity executors
-- request storage writes
-- outbox publishing
+Request state writes, artifact uploads, and terminal callbacks run outside that transaction. An external message sent during the callback cannot be rolled back by the database. Full atomic outbox delivery and durable resume remain future work.
 
-If those components do not participate in the same transaction boundary, rollback remains best-effort.
+## Failure and Completion Contract
+
+Inspect `request.stats.lifecycle` as well as `request.state`:
+
+| Failure | Data outcome | Recovery direction |
+| --- | --- | --- |
+| Created/processing callbacks | `not_started` | Fix the dependency before considering another request |
+| Data execution / transaction | `unknown` | Inspect actual data and rollback outcome |
+| Evidence preparation / upload after execution | `completed` | Recover the original artifact payload; do not repeat erase |
+| Completion status persistence | `completed` | Reconcile stored request, data, and artifact |
+| Terminal outbox/audit callback | Completion state is preserved | Inspect `notificationFailures` and recover delivery only |
+
+The service persists an `unknown` checkpoint before data work. If request persistence becomes unavailable, `DataSubjectPersistenceError` exposes `requestId`, `tenantId`, `dataOutcome`, and `recovery: 'reconcile_request'` without the provider's raw error. Use that ID to reconcile before attempting another erase. Failure metadata contains error codes rather than raw database/provider messages.
+
+Recovery fields are guidance, not an automatic retry API. Artifact payload persistence, idempotency, and durable retries are P1 work. See the [migration guide](docs/p0-migration.md) for the full stage contract and host exception handling.
 
 ## Practical Limitations
 
@@ -355,15 +386,18 @@ The current implementation is intentionally small. A few things are important to
 ## Development
 
 ```bash
-npm test
+npm test -- --runInBand
+npm run lint
 npm run build
+# With a disposable PostgreSQL DATABASE_URL:
+npm run test:compatibility
 ```
 
 ## CI and Release
 
 GitHub Actions is configured with two workflows:
 
-- `CI`: runs `npm ci`, `npm run lint`, `npm test -- --runInBand`, and `npm run build` on pushes, pull requests, and manual runs
+- `CI`: validates on Node 20/22/24 and installs packed tarballs in two PostgreSQL-backed Nest/Prisma consumer profiles on Node 24.11.1
 - `Release`: runs the same validation suite and then publishes to npm when a GitHub Release is published
 
 Release expectations:
@@ -379,6 +413,11 @@ Release expectations:
 
 ## Related Docs
 
+- [P0 migration guide](docs/p0-migration.md)
+- [Verified compatibility and PostgreSQL example](docs/compatibility.md)
+- [Authenticated tenant-safe Nest host example](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe)
+
+- [Market positioning and improvement roadmap](docs/market-positioning-roadmap.md)
 - [docs/prd.md](docs/prd.md)
 - [docs/spec.md](docs/spec.md)
 - [docs/data-subject-0.2.0-feature-proposal.md](docs/data-subject-0.2.0-feature-proposal.md)

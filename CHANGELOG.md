@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project currently tracks the shipped behavior of the repository rather than a long release history.
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking:** export includes only `PolicySpec.exportFields`; omitted lists exclude the entity.
+- **Breaking:** Prisma executors require `tenantField` or explicit `singleTenantId`; the service validates matching scope and nonblank identifiers before execution.
+- **Breaking:** request lookup/update require tenant ID. Request identity fields cannot be patched.
+- Erase transaction completion precedes artifact upload and terminal notifications. Callback failure preserves completed data state.
+- Failure reasons contain stable codes; `stats.lifecycle` records outcome, stage, recovery direction, and notification failures. Persistence errors expose the request ID for reconciliation.
+- Prisma request delegate types accept real generated client types; tested Nest 11 / Prisma 7 peer lines added.
+
+### Added
+
+- Tenant-scoped artifact lookup, optional authenticated actor context, and a fail-closed Nest host example.
+- Real PostgreSQL tests using installed npm tarballs for Nest 10.4.22 / Prisma 5.22.0 and Nest 11.2.7 / Prisma 7.10.0 on Node 24.11.1.
+- [Migration guide](docs/p0-migration.md) and [exact compatibility matrix](docs/compatibility.md).
+
 ## [0.2.0] - 2026-06-19
 
 ### Added

@@ -11,6 +11,8 @@ export interface PolicySpec {
   subjectField: string;
   rowLevel?: 'delete-row' | 'delete-fields';
   fields: Record<string, PolicyEntry>;
+  /** Explicit top-level export allowlist. Omit for an erase-only entity. */
+  exportFields?: string[];
 }
 
 export function compilePolicy(
@@ -18,6 +20,20 @@ export function compilePolicy(
   opts: CompileOptions = {},
 ): EntityPolicy {
   const fields: Record<string, PolicyEntry> = {};
+  const exportFields = spec.exportFields ?? [];
+
+  if (
+    !Array.isArray(exportFields) ||
+    exportFields.some(
+      (field) => typeof field !== 'string' || !field.trim() || field !== field.trim(),
+    ) ||
+    new Set(exportFields).size !== exportFields.length
+  ) {
+    throw new DataSubjectError(
+      DataSubjectErrorCode.InvalidPolicy,
+      `${spec.entityName}: exportFields must contain unique, nonblank top-level field names`,
+    );
+  }
 
   for (const [name, raw] of Object.entries(spec.fields)) {
     fields[name] = normalizeEntry(spec.entityName, name, raw, opts);
@@ -28,6 +44,7 @@ export function compilePolicy(
     subjectField: spec.subjectField,
     rowLevel: spec.rowLevel ?? 'delete-fields',
     fields,
+    exportFields: [...exportFields],
   };
 }
 

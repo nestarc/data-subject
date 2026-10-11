@@ -16,22 +16,22 @@ class FakePrismaRequestDelegate implements PrismaDataSubjectRequestDelegate {
   }
 
   async update(args: {
-    where: { id: string };
+    where: { id: string; tenantId: string };
     data: Record<string, unknown>;
   }): Promise<unknown> {
     const row = this.rows.get(args.where.id);
-    if (!row) {
+    if (!row || row.tenantId !== args.where.tenantId) {
       throw { code: 'P2025' };
     }
-    Object.assign(row, args.data);
+    Object.assign(row, clone(args.data));
     return clone(row);
   }
 
   async findUnique(args: {
-    where: { id: string };
+    where: { id: string; tenantId: string };
   }): Promise<unknown | null> {
     const row = this.rows.get(args.where.id);
-    return row ? clone(row) : null;
+    return row?.tenantId === args.where.tenantId ? clone(row) : null;
   }
 
   async findMany(args: Record<string, unknown>): Promise<unknown[]> {
@@ -82,7 +82,12 @@ function matchesWhere(
 }
 
 function clone(row: Record<string, unknown>): Record<string, unknown> {
-  return { ...row };
+  return Object.fromEntries(
+    Object.entries(row).map(([key, value]) => [
+      key,
+      value instanceof Date ? new Date(value) : structuredClone(value),
+    ]),
+  );
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

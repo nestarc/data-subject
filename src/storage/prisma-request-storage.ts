@@ -1,17 +1,31 @@
 import { DataSubjectError, DataSubjectErrorCode } from '../errors';
 import type { DataSubjectRequest, RequestState, RequestStats } from '../types';
 import type { RequestStorage } from './request-storage.interface';
+import {
+  validateRequestIdentifier,
+  validateRequestIdentity,
+  validateRequestPatch,
+} from './request-storage-validation';
 
 const PENDING: RequestState[] = ['created', 'validating', 'processing'];
 
 export interface PrismaDataSubjectRequestDelegate {
   create(args: { data: Record<string, unknown> }): Promise<unknown>;
   update(args: {
-    where: { id: string };
+    where: { id: string; tenantId: string };
     data: Record<string, unknown>;
   }): Promise<unknown>;
-  findUnique(args: { where: { id: string } }): Promise<unknown | null>;
-  findMany(args: Record<string, unknown>): Promise<unknown[]>;
+  findUnique(args: {
+    where: { id: string; tenantId: string };
+  }): Promise<unknown | null>;
+  findMany(args: {
+    where?: {
+      tenantId?: string;
+      state?: RequestState | { in: RequestState[] };
+      dueAt?: { lt: Date };
+    };
+    orderBy?: { createdAt?: 'asc' | 'desc'; dueAt?: 'asc' | 'desc' };
+  }): Promise<unknown[]>;
 }
 
 export interface PrismaRequestStorageOptions {
@@ -22,6 +36,7 @@ export class PrismaRequestStorage implements RequestStorage {
   constructor(private readonly opts: PrismaRequestStorageOptions) {}
 
   async insert(req: DataSubjectRequest): Promise<void> {
+    validateRequestIdentity(req);
     try {
       await this.opts.delegate.create({ data: serializeRequest(req) });
     } catch (error) {
@@ -37,11 +52,15 @@ export class PrismaRequestStorage implements RequestStorage {
 
   async update(
     id: string,
+    tenantId: string,
     patch: Partial<DataSubjectRequest>,
   ): Promise<void> {
+    validateRequestIdentifier(id, 'id');
+    validateRequestIdentifier(tenantId, 'tenantId');
+    validateRequestPatch(patch);
     try {
       await this.opts.delegate.update({
-        where: { id },
+        where: { id, tenantId },
         data: serializePatch(patch),
       });
     } catch (error) {
@@ -55,8 +74,10 @@ export class PrismaRequestStorage implements RequestStorage {
     }
   }
 
-  async findById(id: string): Promise<DataSubjectRequest | null> {
-    const row = await this.opts.delegate.findUnique({ where: { id } });
+  async findById(id: string, tenantId: string): Promise<DataSubjectRequest | null> {
+    validateRequestIdentifier(id, 'id');
+    validateRequestIdentifier(tenantId, 'tenantId');
+    const row = await this.opts.delegate.findUnique({ where: { id, tenantId } });
     return row ? deserializeRequest(row) : null;
   }
 
@@ -64,6 +85,7 @@ export class PrismaRequestStorage implements RequestStorage {
     tenantId: string,
     opts: { state?: RequestState } = {},
   ): Promise<DataSubjectRequest[]> {
+    validateRequestIdentifier(tenantId, 'tenantId');
     const rows = await this.opts.delegate.findMany({
       where: {
         tenantId,

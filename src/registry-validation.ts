@@ -33,12 +33,17 @@ export function validateRegistry(
       });
     }
 
-    if (opts.requireTenantField) {
+    if (
+      opts.requireTenantField &&
+      (entry.executor.scope?.mode !== 'multi-tenant' ||
+        !entry.executor.scope.tenantField?.trim() ||
+        entry.executor.scope.tenantField === policy.subjectField)
+    ) {
       findings.push({
-        severity: 'warning',
+        severity: 'error',
         code: 'dsr_lint_missing_tenant_field',
         model: policy.entityName,
-        message: `${policy.entityName} tenantField cannot be verified from runtime registry metadata`,
+        message: `${policy.entityName} requires multi-tenant executor metadata with a distinct, nonblank tenantField`,
       });
     }
   }

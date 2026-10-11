@@ -35,7 +35,9 @@
     "docs/spec.md",
     "prisma",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "docs/compatibility.md",
+    "docs/p0-migration.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -44,15 +46,16 @@
     "bench": "ts-node bench/data-subject.bench.ts",
     "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\"",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test:compatibility": "node test/compatibility/run.cjs"
   },
   "dependencies": {
     "jszip": "^3.10.1"
   },
   "peerDependencies": {
-    "@nestjs/common": "^10.0.0",
-    "@nestjs/core": "^10.0.0",
-    "@prisma/client": "^5.0.0",
+    "@nestjs/common": "^10.0.0 || ^11.2.7",
+    "@nestjs/core": "^10.0.0 || ^11.2.7",
+    "@prisma/client": "^5.0.0 || ^7.10.0",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.0.0"
   },

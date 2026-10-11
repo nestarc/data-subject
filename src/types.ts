@@ -18,6 +18,7 @@ export interface EntityPolicy {
   subjectField: string;
   rowLevel: RowLevel;
   fields: Record<string, PolicyEntry>;
+  exportFields: string[];
 }
 
 export interface ErasePlan {
@@ -25,10 +26,20 @@ export interface ErasePlan {
   deleteFields: string[];
 }
 
+export type TenantScope =
+  | { mode: 'multi-tenant'; tenantField: string }
+  | { mode: 'single-tenant'; tenantId: string };
+
 export interface EntityExecutor {
+  /** Required at runtime by DataSubjectService; custom executors must enforce this scope. */
+  scope?: TenantScope;
   select(subjectId: string, tenantId: string): Promise<Record<string, unknown>[]>;
   erase(subjectId: string, tenantId: string, plan: ErasePlan): Promise<number>;
-  anonymize(subjectId: string, tenantId: string, replacements: Record<string, unknown>): Promise<number>;
+  anonymize(
+    subjectId: string,
+    tenantId: string,
+    replacements: Record<string, unknown>,
+  ): Promise<number>;
 }
 
 export interface RegisteredEntity {
@@ -57,6 +68,8 @@ export interface DataSubjectRequest {
 }
 
 export interface RequestStats {
+  /** Stored in the existing stats JSON column; no schema migration is required. */
+  lifecycle?: RequestLifecycle;
   entities: Array<{
     entityName: string;
     affected: number;
@@ -77,6 +90,26 @@ export interface RequestStats {
     artifactHash: string;
     artifactUrl: string;
   };
+}
+
+export type FailureStage =
+  | 'request_created'
+  | 'processing'
+  | 'data_execution'
+  | 'artifact_write'
+  | 'completion_persistence';
+
+export interface RequestLifecycle {
+  dataOutcome: 'not_started' | 'unknown' | 'completed';
+  failureStage?: FailureStage;
+  recovery?: 'retry_request' | 'inspect_data' | 'retry_artifact' | 'reconcile_request';
+  /** Callback delivery failures never undo completed data processing. */
+  notificationFailures?: Array<{
+    channel: 'outbox' | 'audit';
+    event: string;
+    code: string;
+    recovery: 'retry_notification';
+  }>;
 }
 
 export interface ErasureEvidenceAction {
@@ -144,5 +177,8 @@ export type DataSubjectOutboxEvent =
         requestType: RequestType;
         tenantId: string;
         failureReason: string;
+        failureStage: FailureStage;
+        dataOutcome: RequestLifecycle['dataOutcome'];
+        recovery: NonNullable<RequestLifecycle['recovery']>;
       };
     };

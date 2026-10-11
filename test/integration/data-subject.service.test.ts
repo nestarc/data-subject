@@ -1,8 +1,5 @@
 import { DataSubjectErrorCode } from '../../src/errors';
-import {
-  erasureEvidenceArtifactKey,
-  sha256Hex,
-} from '../../src/artifacts';
+import { erasureEvidenceArtifactKey, sha256Hex } from '../../src/artifacts';
 import { DataSubjectService } from '../../src/data-subject.service';
 import { Registry } from '../../src/registry';
 import { InMemoryArtifactStorage } from '../../src/storage/in-memory-artifact-storage';
@@ -13,6 +10,7 @@ function makeExec(rows: Record<string, unknown>[]): EntityExecutor {
   const state = { rows: [...rows] };
 
   return {
+    scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
     select: async () => [...state.rows],
     erase: async (_subjectId, _tenantId, plan: ErasePlan) => {
       const count = state.rows.length;
@@ -41,6 +39,7 @@ function svc() {
       entityName: 'User',
       subjectField: 'userId',
       fields: { email: 'delete' },
+      exportFields: ['email'],
     },
     executor: makeExec([{ id: 'u1', email: 'a@b.com' }]),
   });
@@ -80,7 +79,7 @@ describe('DataSubjectService', () => {
     expect(request.state).toBe('completed');
     expect(request.artifactHash).toMatch(/^[a-f0-9]{64}$/);
 
-    const stored = await requests.findById(request.id);
+    const stored = await requests.findById(request.id, 'tenant_1');
     expect(stored?.state).toBe('completed');
     expect(outboxEvents).toContainEqual({
       type: 'data_subject.request_completed',
@@ -97,9 +96,7 @@ describe('DataSubjectService', () => {
 
     await service.erase('subject_1', 'tenant_1');
 
-    const event = outboxEvents.find(
-      (item) => item.type === 'data_subject.erasure_requested',
-    );
+    const event = outboxEvents.find((item) => item.type === 'data_subject.erasure_requested');
 
     expect(event).toBeDefined();
     expect(event?.payload).toMatchObject({
@@ -188,7 +185,7 @@ describe('DataSubjectService', () => {
   it('getRequest throws a typed error for missing ids', async () => {
     const { service } = svc();
 
-    await expect(service.getRequest('missing')).rejects.toMatchObject({
+    await expect(service.getRequest('missing', 'tenant_1')).rejects.toMatchObject({
       code: DataSubjectErrorCode.RequestNotFound,
     });
   });
@@ -201,8 +198,10 @@ describe('DataSubjectService', () => {
         subjectField: 'userId',
         rowLevel: 'delete-row',
         fields: { email: 'delete' },
+        exportFields: ['email'],
       },
       executor: {
+        scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
         select: async () => [{ id: 'u1' }],
         erase: async () => 0,
         anonymize: async () => 0,
@@ -220,7 +219,12 @@ describe('DataSubjectService', () => {
     const request = await service.erase('subject_1', 'tenant_1');
 
     expect(request.state).toBe('failed');
-    expect(request.failureReason).toMatch(/residual/);
+    expect(request.failureReason).toBe(DataSubjectErrorCode.VerificationFailed);
+    expect(request.stats?.lifecycle).toMatchObject({
+      dataOutcome: 'unknown',
+      failureStage: 'data_execution',
+      recovery: 'inspect_data',
+    });
   });
 
   it('publishes request_failed for export errors', async () => {
@@ -230,8 +234,10 @@ describe('DataSubjectService', () => {
         entityName: 'User',
         subjectField: 'userId',
         fields: { email: 'delete' },
+        exportFields: ['email'],
       },
       executor: {
+        scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
         select: async () => {
           throw 'boom';
         },
@@ -255,17 +261,17 @@ describe('DataSubjectService', () => {
     const request = await service.export('subject_1', 'tenant_1');
 
     expect(request.state).toBe('failed');
-    expect(request.failureReason).toBe('boom');
+    expect(request.failureReason).toBe('dsr_operation_failed');
     expect(outboxEvents).toContainEqual({
       type: 'data_subject.request_failed',
       payload: expect.objectContaining({
         requestId: request.id,
-        failureReason: 'boom',
+        failureReason: 'dsr_operation_failed',
       }),
     });
   });
 
-  it('uses runInTransaction so integrations can roll back late erase failures', async () => {
+  it('keeps committed erase completed when completion callback fails', async () => {
     const state = { rows: [{ id: 'u1', email: 'a@b.com' }] };
     const registry = new Registry();
     registry.register({
@@ -274,8 +280,10 @@ describe('DataSubjectService', () => {
         subjectField: 'userId',
         rowLevel: 'delete-row',
         fields: { email: 'delete' },
+        exportFields: ['email'],
       },
       executor: {
+        scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
         select: async () => [...state.rows],
         erase: async () => {
           const count = state.rows.length;
@@ -313,8 +321,20 @@ describe('DataSubjectService', () => {
     const request = await service.erase('subject_1', 'tenant_1');
 
     expect(transactionCalls).toBe(1);
-    expect(request.state).toBe('failed');
-    expect(request.failureReason).toBe('outbox commit failed');
-    expect(state.rows).toEqual([{ id: 'u1', email: 'a@b.com' }]);
+    expect(request.state).toBe('completed');
+    expect(request.failureReason).toBeNull();
+    expect(request.failedAt).toBeNull();
+    expect(request.stats?.lifecycle).toMatchObject({
+      dataOutcome: 'completed',
+      notificationFailures: [
+        {
+          channel: 'outbox',
+          event: 'data_subject.request_completed',
+          code: 'dsr_operation_failed',
+          recovery: 'retry_notification',
+        },
+      ],
+    });
+    expect(state.rows).toEqual([]);
   });
 });

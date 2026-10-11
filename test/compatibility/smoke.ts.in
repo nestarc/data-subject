@@ -1,0 +1,117 @@
+import 'reflect-metadata';
+import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
+import { Test } from '@nestjs/testing';
+import JSZip from 'jszip';
+import {
+  DataSubjectModule,
+  DataSubjectService,
+  InMemoryArtifactStorage,
+  PrismaRequestStorage,
+  fromPrisma,
+  type DataSubjectModuleOptions,
+} from '@nestarc/data-subject';
+import { db } from './client';
+
+type TransactionDelegates = Pick<typeof db, 'profile' | 'invoice' | 'dataSubjectRequest'>;
+const transactionContext = new AsyncLocalStorage<TransactionDelegates>();
+// The same delegates resolve against the transaction client during data execution.
+function delegate<K extends keyof TransactionDelegates>(name: K): TransactionDelegates[K] {
+  return new Proxy(db[name], {
+    get(_target, key) {
+      const target = (transactionContext.getStore() ?? db)[name];
+      const value = Reflect.get(target, key);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+const artifactStorage = new InMemoryArtifactStorage();
+const requestStorage = new PrismaRequestStorage({ delegate: delegate('dataSubjectRequest') });
+const profileExecutor = fromPrisma({ delegate: delegate('profile'), subjectField: 'subjectId', tenantField: 'tenantId' });
+const invoiceExecutor = fromPrisma({ delegate: delegate('invoice'), subjectField: 'subjectId', tenantField: 'tenantId' });
+const baseOptions: DataSubjectModuleOptions = {
+  requestStorage,
+  artifactStorage,
+  runInTransaction: (work) => db.$transaction((tx) => transactionContext.run(tx, work)),
+  entities: [
+    { policy: { entityName: 'Profile', subjectField: 'subjectId', rowLevel: 'delete-row', fields: { email: 'delete' }, exportFields: ['id', 'email'] }, executor: profileExecutor },
+    { policy: { entityName: 'Invoice', subjectField: 'subjectId', fields: { email: 'delete', total: { strategy: 'retain', legalBasis: 'GDPR Art. 17(3)(b)' } }, exportFields: ['id', 'email', 'total'] }, executor: invoiceExecutor },
+  ],
+};
+
+async function seed(subjectId: string) {
+  await db.profile.createMany({ data: ['tenant-a', 'tenant-b'].map((tenantId) => ({ id: `${subjectId}-${tenantId}`, subjectId, tenantId, email: `${tenantId}@example.test`, passwordHash: 'secret-hash', accessToken: 'secret-token' })) });
+  await db.invoice.createMany({ data: ['tenant-a', 'tenant-b'].map((tenantId) => ({ id: `${subjectId}-${tenantId}`, subjectId, tenantId, email: `${tenantId}@example.test`, total: 42 })) });
+}
+
+async function createService(options: DataSubjectModuleOptions = baseOptions) {
+  const module = await Test.createTestingModule({ imports: [DataSubjectModule.forRoot(options)] }).compile();
+  await module.init();
+  return { module, service: module.get(DataSubjectService) };
+}
+
+async function main() {
+  await seed('shared-subject');
+  const { module, service } = await createService();
+  try {
+    const exported = await service.export('shared-subject', 'tenant-a');
+    assert.equal(exported.state, 'completed');
+    const artifact = await service.getArtifact(exported.id, 'tenant-a');
+    assert.ok(artifact);
+    assert.equal(createHash('sha256').update(artifact.body).digest('hex'), exported.artifactHash);
+    const zip = await JSZip.loadAsync(artifact.body);
+    const profile = JSON.parse(await zip.file('Profile.json')!.async('string'));
+    assert.deepEqual(profile, [{ id: 'shared-subject-tenant-a', email: 'tenant-a@example.test' }]);
+    const json = await zip.file('Profile.json')!.async('string');
+    assert.ok(!json.includes('secret-hash') && !json.includes('secret-token'));
+    await assert.rejects(service.getRequest(exported.id, 'tenant-b'));
+    await assert.rejects(service.getArtifact(exported.id, 'tenant-b'));
+
+    const erased = await service.erase('shared-subject', 'tenant-a');
+    assert.equal(erased.state, 'completed');
+    assert.equal(await db.profile.count({ where: { tenantId: 'tenant-a', subjectId: 'shared-subject' } }), 0);
+    assert.equal(await db.profile.count({ where: { tenantId: 'tenant-b', subjectId: 'shared-subject' } }), 1);
+    const invoiceA = await db.invoice.findUniqueOrThrow({ where: { id: 'shared-subject-tenant-a' } });
+    const invoiceB = await db.invoice.findUniqueOrThrow({ where: { id: 'shared-subject-tenant-b' } });
+    assert.equal(invoiceA.email, null);
+    assert.equal(invoiceA.total, 42);
+    assert.equal(invoiceB.email, 'tenant-b@example.test');
+    assert.equal(erased.stats?.retained?.[0].count, 1);
+    assert.equal((await service.getRequest(erased.id, 'tenant-a')).stats?.lifecycle?.dataOutcome, 'completed');
+    const evidence = await service.getArtifact(erased.id, 'tenant-a');
+    assert.ok(evidence);
+    assert.equal(JSON.parse(evidence.body.toString()).state, 'completed');
+  } finally { await module.close(); }
+
+  await seed('rollback-subject');
+  const rollback = await createService({ ...baseOptions, entities: [baseOptions.entities![0], { ...baseOptions.entities![1], executor: { ...invoiceExecutor, async anonymize(subjectId, tenantId) {
+    // Real PostgreSQL primary-key violation after Profile's DELETE has run.
+    const result = await delegate('invoice').updateMany({ where: { subjectId, tenantId }, data: { id: 'shared-subject-tenant-b' } });
+    return result.count;
+  } } }] });
+  try {
+    const request = await rollback.service.erase('rollback-subject', 'tenant-a');
+    assert.equal(request.state, 'failed');
+    assert.equal(request.stats?.lifecycle?.failureStage, 'data_execution');
+    assert.equal(request.completedAt, null);
+    assert.equal(request.artifactUrl, null);
+    assert.equal(await db.profile.count({ where: { tenantId: 'tenant-a', subjectId: 'rollback-subject' } }), 1);
+    assert.equal((await db.invoice.findUniqueOrThrow({ where: { id: 'rollback-subject-tenant-a' } })).email, 'tenant-a@example.test');
+  } finally { await rollback.module.close(); }
+
+  await seed('callback-subject');
+  const callback = await createService({ ...baseOptions, publishOutbox: async (type) => { if (type === 'data_subject.request_completed') throw new Error('completion delivery failed'); } });
+  try {
+    const request = await callback.service.erase('callback-subject', 'tenant-a');
+    assert.equal(request.state, 'completed');
+    assert.equal(request.stats?.lifecycle?.notificationFailures?.[0].recovery, 'retry_notification');
+    assert.equal(await db.profile.count({ where: { tenantId: 'tenant-a', subjectId: 'callback-subject' } }), 0);
+  } finally { await callback.module.close(); }
+  console.log('PASS: packed consumer types, Nest module, export allowlist, tenant isolation, erase, retention, PostgreSQL rollback, completion delivery failure');
+}
+
+main().finally(() => db.$disconnect()).catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});

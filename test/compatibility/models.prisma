@@ -1,0 +1,37 @@
+model Profile {
+  id           String @id
+  tenantId     String
+  subjectId    String
+  email        String
+  passwordHash String
+  accessToken  String
+  @@index([tenantId, subjectId])
+}
+
+model Invoice {
+  id        String @id
+  tenantId  String
+  subjectId String
+  email     String?
+  total     Int
+  @@index([tenantId, subjectId])
+}
+
+model DataSubjectRequest {
+  id            String @id
+  tenantId      String
+  subjectId     String
+  type          String
+  state         String
+  createdAt     DateTime
+  dueAt         DateTime
+  completedAt   DateTime?
+  failedAt      DateTime?
+  failureReason String?
+  artifactHash  String?
+  artifactUrl   String?
+  stats         Json?
+  requestedBy   String?
+  @@index([tenantId, subjectId])
+  @@index([state, dueAt])
+}

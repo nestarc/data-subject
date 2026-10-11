@@ -106,6 +106,7 @@ function makeRows(subjectId: string, tenantId: string, count: number): Row[] {
  * a full-scale workload rather than a drained one.
  */
 class InMemoryExecutor implements EntityExecutor {
+  scope = { mode: 'multi-tenant' as const, tenantField: 'tenantId' };
   rows: Row[] = [];
 
   seed(count: number, subjectId: string, tenantId: string): void {
@@ -214,6 +215,7 @@ async function run() {
           subjectField: 'userId',
           rowLevel: 'delete-fields' as const,
           fields: { email: 'delete' as const },
+          exportFields: ['id', 'userId', 'email', 'name'],
         },
         executor: (() => {
           const ex = new InMemoryExecutor();

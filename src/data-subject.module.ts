@@ -1,9 +1,6 @@
 import { DynamicModule, Module, type Provider } from '@nestjs/common';
 
-import {
-  DataSubjectService,
-  type DataSubjectServiceDeps,
-} from './data-subject.service';
+import { DataSubjectService, type DataSubjectServiceDeps } from './data-subject.service';
 import { Registry, type RegisterInput } from './registry';
 import type { ArtifactStorage } from './storage/artifact-storage.interface';
 import type { RequestStorage } from './storage/request-storage.interface';
@@ -14,6 +11,7 @@ export interface DataSubjectModuleOptions {
   requestStorage: RequestStorage;
   artifactStorage: ArtifactStorage;
   slaDays?: number;
+  singleTenantId?: string;
   strictLegalBasis?: boolean;
   entities?: RegisterInput[];
   publishOutbox?: DataSubjectServiceDeps['publishOutbox'];
@@ -47,6 +45,7 @@ export class DataSubjectModule {
             requestStorage: options.requestStorage,
             artifactStorage: options.artifactStorage,
             slaDays: options.slaDays ?? 30,
+            singleTenantId: options.singleTenantId,
             publishOutbox: options.publishOutbox,
             publishAudit: options.publishAudit,
             runInTransaction: options.runInTransaction,

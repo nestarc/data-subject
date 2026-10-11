@@ -2,6 +2,37 @@ import { DataSubjectError } from './errors';
 import { compilePolicy } from './policy-compiler';
 
 describe('compilePolicy', () => {
+  it('keeps export allowlists independent of erasure policy and copies them', () => {
+    const exportFields = ['id', 'email'];
+    const policy = compilePolicy({
+      entityName: 'User',
+      subjectField: 'userId',
+      fields: { email: 'delete', passwordHash: 'delete' },
+      exportFields,
+    });
+    exportFields.push('passwordHash');
+    expect(policy.exportFields).toEqual(['id', 'email']);
+  });
+
+  it('defaults missing export allowlists to no exported fields', () => {
+    expect(compilePolicy({
+      entityName: 'User',
+      subjectField: 'userId',
+      fields: { passwordHash: 'delete' },
+    }).exportFields).toEqual([]);
+  });
+
+  it.each([[['']], [['   ']], [[' email']], [['email', 'email']], [[1]], ['email']])(
+    'rejects malformed export allowlists %j', (exportFields) => {
+      expect(() => compilePolicy({
+        entityName: 'User',
+        subjectField: 'userId',
+        fields: { email: 'delete' },
+        exportFields: exportFields as unknown as string[],
+      })).toThrow(/exportFields/);
+    },
+  );
+
   it('normalizes shorthand "delete" to { strategy: "delete" }', () => {
     const policy = compilePolicy({
       entityName: 'User',

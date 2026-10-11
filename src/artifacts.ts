@@ -26,5 +26,9 @@ function dataSubjectArtifactKey(
 }
 
 function keySegment(value: string): string {
-  return encodeURIComponent(value);
+  // encodeURIComponent leaves dot segments unchanged; storage implementations
+  // using path normalization must never treat a tenant/request ID as a parent.
+  return value === '.' || value === '..'
+    ? value.replace(/\./g, '%2E')
+    : encodeURIComponent(value);
 }

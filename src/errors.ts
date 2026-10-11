@@ -1,3 +1,5 @@
+import type { RequestLifecycle } from './types';
+
 export const DataSubjectErrorCode = {
   SubjectNotFound: 'dsr_subject_not_found',
   UnregisteredEntity: 'dsr_unregistered_entity',
@@ -10,10 +12,12 @@ export const DataSubjectErrorCode = {
   ArtifactWriteFailed: 'dsr_artifact_write_failed',
   InvalidStateTransition: 'dsr_invalid_state_transition',
   EvidenceReportInvalid: 'dsr_evidence_report_invalid',
+  InvalidInput: 'dsr_invalid_input',
+  InvalidScope: 'dsr_invalid_scope',
+  RequestPersistenceFailed: 'dsr_request_persistence_failed',
 } as const;
 
-export type DataSubjectErrorCode =
-  (typeof DataSubjectErrorCode)[keyof typeof DataSubjectErrorCode];
+export type DataSubjectErrorCode = (typeof DataSubjectErrorCode)[keyof typeof DataSubjectErrorCode];
 
 const HTTP_STATUS: Record<DataSubjectErrorCode, number> = {
   dsr_subject_not_found: 404,
@@ -27,6 +31,9 @@ const HTTP_STATUS: Record<DataSubjectErrorCode, number> = {
   dsr_artifact_write_failed: 500,
   dsr_invalid_state_transition: 500,
   dsr_evidence_report_invalid: 500,
+  dsr_invalid_input: 400,
+  dsr_invalid_scope: 400,
+  dsr_request_persistence_failed: 500,
 };
 
 export class DataSubjectError extends Error {
@@ -38,5 +45,19 @@ export class DataSubjectError extends Error {
     this.name = 'DataSubjectError';
     this.code = code;
     this.httpStatus = HTTP_STATUS[code];
+  }
+}
+
+/** An indeterminate storage failure: reconcile this ID before executing again. */
+export class DataSubjectPersistenceError extends DataSubjectError {
+  readonly recovery = 'reconcile_request' as const;
+
+  constructor(
+    readonly requestId: string,
+    readonly tenantId: string,
+    readonly dataOutcome: RequestLifecycle['dataOutcome'],
+  ) {
+    super(DataSubjectErrorCode.RequestPersistenceFailed);
+    this.name = 'DataSubjectPersistenceError';
   }
 }
