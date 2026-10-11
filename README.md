@@ -2,7 +2,7 @@
 
 `@nestarc/data-subject` is a small NestJS-oriented toolkit for handling data-subject export and erasure requests against subject-scoped data.
 
-Today the package ships:
+The current source build provides:
 
 - a programmatic entity registry and a shared JSON policy definition for runtime/lint
 - a `DataSubjectService` for `export`, `erase`, and request lookup
@@ -21,7 +21,7 @@ Today the package ships:
 
 ## Current Scope
 
-Package version: `0.2.0`. The working tree includes unreleased P0/P1/P2 changes; the migration notes below apply to this source build, not the published 0.2.0 tarball.
+Package metadata remains at `0.2.0`. This source build includes unreleased P0/P1/P2, benchmark, and example improvements recorded in the [changelog](CHANGELOG.md). The setup and API descriptions below apply to this source build; see the tagged release documentation when using a released tarball.
 
 This repository focuses on the execution core plus the minimum production trust layer. It does **not** currently ship:
 
@@ -40,7 +40,9 @@ If you need database-specific behavior, you can plug in your own `EntityExecutor
 npm install @nestarc/data-subject
 ```
 
-Peer dependencies used by this package:
+For the unreleased APIs below, build this checkout with `npm ci && npm run build && npm pack` and install the resulting tarball into your application. Installing the registry version does not select this checkout.
+
+Node.js 20 or newer is required; the chosen Prisma/Nest versions may impose stricter requirements. Peer dependencies used by this package:
 
 - `@nestjs/common`
 - `@nestjs/core`
@@ -54,9 +56,37 @@ The [P2 execution guide](docs/p2-execution.md) covers job migrations, batch boun
 
 ## Quick Start
 
-This example uses Prisma 5 client initialization. The compatibility guide includes the Prisma 7 generator and driver-adapter setup. Before exposing service calls over HTTP, connect authentication, authorization, and subject verification as shown in the [tenant-safe host example](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe).
+This example uses Prisma 5 client initialization. Merge `DataSubjectRequest` and its related `DataSubjectExecution` model from [the Prisma schema example](prisma/schema.example.prisma), plus the [User model fragment](https://github.com/nestarc/data-subject/blob/main/examples/tenant-safe/schema.example.prisma), into your application schema, apply your migration, and regenerate the client. The User fragment has an immutable `id`, `userId`, `tenantId`, and four nullable personal-data fields. The P2 job models are only needed when enabling that path. The compatibility guide includes Prisma 7 generator and driver-adapter setup.
+
+Define one policy for runtime registration and schema lint:
 
 ```ts
+// policy.ts
+import { definePolicy } from '@nestarc/data-subject';
+
+export const definitions = definePolicy([{
+  entityName: 'User',
+  subjectField: 'userId',
+  stableIdField: 'id',
+  scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
+  rowLevel: 'delete-fields',
+  fields: {
+    email: 'delete',
+    displayName: 'delete',
+    passwordHash: 'delete',
+    sessionToken: 'delete',
+  },
+  exportFields: ['email', 'displayName'],
+  ignoredFields: {
+    id: 'Immutable identity used for post-write verification',
+    userId: 'Subject lookup key retained while personal fields are cleared',
+    tenantId: 'Tenant boundary retained on every read and write',
+  },
+}]);
+```
+
+```ts
+// app.module.ts
 import { Module } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 import {
@@ -65,78 +95,30 @@ import {
   PrismaRequestStorage,
   fromPrisma,
 } from '@nestarc/data-subject';
+import { definitions } from './policy';
 
 const prisma = new PrismaClient();
-const artifactStorage = new InMemoryArtifactStorage(); // local/dev only; use private durable storage in production
 
 @Module({
-  imports: [
-    DataSubjectModule.forRoot({
-      requestStorage: new PrismaRequestStorage({
-        delegate: prisma.dataSubjectRequest,
+  imports: [DataSubjectModule.forRoot({
+    requestStorage: new PrismaRequestStorage({ delegate: prisma.dataSubjectRequest }),
+    artifactStorage: new InMemoryArtifactStorage(), // local development only
+    slaDays: 30,
+    definitions: [{
+      definition: definitions[0],
+      executor: fromPrisma({
+        delegate: prisma.user,
+        subjectField: 'userId',
+        tenantField: 'tenantId',
+        stableIdField: 'id',
       }),
-      artifactStorage,
-      slaDays: 30,
-      strictLegalBasis: true,
-      entities: [
-        {
-          policy: {
-            entityName: 'User',
-            subjectField: 'userId',
-            exportFields: ['email', 'name'],
-            rowLevel: 'delete-row',
-            fields: {
-              email: 'delete',
-              name: 'delete',
-            },
-          },
-          executor: fromPrisma({
-            delegate: prisma.user,
-            subjectField: 'userId',
-            tenantField: 'tenantId',
-          }),
-        },
-        {
-          policy: {
-            entityName: 'Invoice',
-            subjectField: 'customerId',
-            exportFields: ['customerName', 'customerEmail', 'amount'],
-            fields: {
-              customerName: {
-                strategy: 'retain',
-                legalBasis: 'tax:KR-basic-law-sec85',
-                until: '+7y',
-              },
-              amount: {
-                strategy: 'retain',
-                legalBasis: 'tax:KR-basic-law-sec85',
-              },
-              customerEmail: {
-                strategy: 'anonymize',
-                replacement: '[REDACTED]',
-              },
-            },
-          },
-          executor: fromPrisma({
-            delegate: prisma.invoice,
-            subjectField: 'customerId',
-            tenantField: 'tenantId',
-          }),
-        },
-      ],
-      publishOutbox: async (type, payload) => {
-        // forward to your outbox publisher
-      },
-      publishAudit: async (event, data) => {
-        // optional hook
-      },
-    }),
-  ],
+    }],
+  })],
 })
 export class AppModule {}
 ```
 
-The quick start uses the immediate execution path. For durable idempotency and completion recovery, configure `PrismaExecutionStore` with transaction-bound delegates as shown in the [P1 guide](docs/p1-migration.md).
+This quick start uses immediate execution without a transaction hook and does not promise rollback. Before exposing HTTP routes, connect authentication, authorization, subject verification, and private storage through the [tenant-safe host example](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe). For signed-preview execution, bind all delegates to a Serializable transaction; for durable idempotency and completion recovery, configure `PrismaExecutionStore` as shown in the [P1 guide](docs/p1-migration.md).
 
 For tests and local development, `InMemoryRequestStorage` and `InMemoryArtifactStorage` are still available. Do not use in-memory storage for production request history or evidence retention.
 
@@ -158,7 +140,7 @@ Multi-tenant mode is the default: every executor must declare tenant scope, and 
 
 ## Policy Model
 
-Policies are registered per entity and compiled before execution.
+Policies are registered per entity and compiled before execution. Prefer shared `definePolicy()` definitions with the module’s `definitions` option or `Registry.registerDefinition()` so runtime and lint consume the same policy. The legacy `entities`/`Registry.register()` API remains available.
 
 ### `delete`
 
@@ -198,7 +180,8 @@ fields: {
 ```
 
 - `legalBasis` is required
-- `strictLegalBasis: true` enables `scheme:reference` validation
+- `strictLegalBasis: true` enables `scheme:reference` format validation; the host decides the applicable basis
+- `until` is retention metadata, not a scheduler that automatically deletes data when the date passes
 - `pseudonymize` is part of the type model, but this package does not perform pseudonymization by itself
 
 ### Mixed Strategies
@@ -236,7 +219,7 @@ Current export artifact shape:
 
 ## Erase Behavior
 
-`DataSubjectService.erase(subjectId, tenantId)` does the following:
+On the immediate path, `DataSubjectService.erase(subjectId, tenantId)` does the following (the durable callback ordering is described under Transaction Boundaries):
 
 1. creates a request record
 2. transitions the request to `processing`
@@ -244,7 +227,7 @@ Current export artifact shape:
 4. publishes `data_subject.erasure_requested`
 5. executes each registered entity according to its compiled policy
 6. performs a post-scan and residual verification
-7. after the transaction resolves, stores an erase evidence JSON artifact through `ArtifactStorage.put(...)`
+7. after data execution and any configured transaction resolve, stores an erase evidence JSON artifact through `ArtifactStorage.put(...)`
 8. records:
    - `stats.entities[]`
    - `stats.retained[]`
@@ -287,29 +270,49 @@ The module exports:
 
 ## Public API
 
-The package currently exports:
+The root entry point `@nestarc/data-subject` exposes these APIs and their associated TypeScript types:
 
-- `DataSubjectService`
-- `DataSubjectModule`
-- `Registry`
-- `compilePolicy`
-- `validateLegalBasis`
-- `fromPrisma`
-- `InMemoryRequestStorage`
-- `InMemoryArtifactStorage`
-- `PrismaRequestStorage`
-- `lintPrismaSchema`
-- `validateRegistry`
-- all public types from `src/types.ts`
-- typed errors from `src/errors.ts`
+| Area | Main exports |
+| --- | --- |
+| Service and Nest module | `DataSubjectService`, `DataSubjectModule`, `DATA_SUBJECT_REGISTRY`, `RequestContext` |
+| Shared policy | `Registry`, `definePolicy`, `validateDefinition`, `compilePolicy`, `hashRegistryPolicy`, `validateLegalBasis` |
+| Preview and verification | `ErasurePreview`, `ErasureVerificationError`, `buildErasureEvidenceArtifact` |
+| Prisma and storage | `fromPrisma`, `PrismaRequestStorage`, `PrismaExecutionStore`, `InMemoryRequestStorage`, `InMemoryArtifactStorage`, `RequestStorage`, `ArtifactStorage` |
+| Artifact identity | `exportArtifactKey`, `erasureEvidenceArtifactKey`, `sha256Hex` |
+| Schema validation | `lintPrismaSchema`, `parsePrismaSchema`, `formatLintReport`, `shouldFailLint`, `validateRegistry` |
+| Paged jobs | `PostgresJobStore`, `pagedFromPrisma`, `createPagedPrivacyHandler`, `createPagedPrivacyPayload`, `PAGED_PRIVACY_JOB_KIND` |
+| Transcend integration | `TranscendErasureAdapter`, `TranscendIntegrationError`, `TRANSCEND_ERASURE_JOB` |
+| Core errors | `DataSubjectError`, `DataSubjectErrorCode`, `DataSubjectPersistenceError` |
+
+The `@nestarc/data-subject/lint` subpath also exposes the lint API. Private S3 and Nestarc composition integrations are repository examples, not additional package export paths.
 
 ## Schema Lint
 
 The package includes a small Prisma schema linter:
 
 ```bash
-npx @nestarc/data-subject lint --schema prisma/schema.prisma --config data-subject.config.json
+# data-subject.config.cjs imports definitions from the compiled policy.ts above.
+npx data-subject lint --schema prisma/schema.prisma --config data-subject.config.cjs
 ```
+
+For that config, reuse the application’s compiled policy:
+
+```js
+// data-subject.config.cjs
+const { definitions } = require('./dist/policy.js');
+module.exports = {
+  definitions,
+  strictCoverage: true,
+  checkRelations: true,
+  suppressions: [
+    { model: 'DataSubjectRequest', reason: 'Request history has separate host access and retention policies' },
+    { model: 'DataSubjectExecution', reason: 'Recovery payloads use privileged expiry; execution metadata has separate retention' },
+  ],
+  // Review and add a specific reason for any other workflow or unrelated model.
+};
+```
+
+Build `policy.ts` before running the CLI and adapt the compiled path to your application. The suppressions describe separate host responsibilities; they do not implement access control or cleanup. Config files may be `.json`, `.js`, `.cjs`, or `.mjs`; `.mjs` uses native ESM loading, including top-level await.
 
 Use `definePolicy()` once and consume the same definitions in `Registry.registerDefinition()` and the lint config. Shared definitions enable strict scalar coverage and declared relation checks by default: new fields need a policy or an exclusion reason; required-field null writes, unsafe parent deletion or reference-key updates, retained-child conflicts, missing dependencies, and cycles fail validation. The parser supports a documented Prisma subset; also run `prisma validate`. See the [shared-policy example](docs/p1-migration.md).
 
@@ -320,12 +323,11 @@ Use `definePolicy()` once and consume the same definitions in `Registry.register
 If `publishOutbox` is provided, the built-in service emits:
 
 - `data_subject.request_created`
-- `data_subject.request_processing` through the audit hook
 - `data_subject.erasure_requested`
 - `data_subject.request_completed`
 - `data_subject.request_failed`
 
-`request_completed` and `request_failed` are emitted for both export and erase requests. `erasure_requested` is erase-only.
+`request_completed` and `request_failed` are emitted for both export and erase requests. `erasure_requested` is erase-only. `request_processing` belongs to the audit hook, not the outbox hook.
 
 ### Audit Hook
 
@@ -335,6 +337,8 @@ If `publishAudit` is provided, the built-in service currently emits:
 - `data_subject.request_processing`
 - `data_subject.request_completed`
 - `data_subject.request_failed`
+
+With durable execution, both hooks also receive `data_subject.artifact_expired` when a pending retry payload expires. Durable callbacks receive a `DeliveryContext` as their third argument; deduplicate its stable `id` because callbacks may be delivered more than once. Callback timing differs between immediate and durable execution, as described below.
 
 ## Typed Errors
 
@@ -352,10 +356,15 @@ Currently used codes include:
 - `dsr_request_conflict`
 - `dsr_request_not_found`
 - `dsr_artifact_write_failed`
+- `dsr_artifact_expired`
+- `dsr_plan_mismatch`
+- `dsr_plan_expired`
+- `dsr_verification_unavailable`
+- `dsr_durable_execution_required`
 - `dsr_invalid_state_transition`
 - `dsr_evidence_report_invalid`
 
-Some additional codes exist in the public enum for future or adapter-specific use.
+The public enum also contains reserved or adapter-specific codes. `DataSubjectPersistenceError` carries a reconciliation ID; `ErasureVerificationError` carries verification details. Transcend integration failures use the separate `TranscendIntegrationError` type.
 
 ## Transaction Boundaries
 
@@ -372,7 +381,7 @@ The hook wraps erase data reads, mutations, verification, and `erasure_requested
 
 On the immediate path, request state writes, artifact uploads, and terminal callbacks run outside that transaction. An external message cannot be rolled back by the database.
 
-The optional `PrismaExecutionStore` path reserves `(tenantId, type, requestKey)` with a unique constraint and uses Serializable transactions to commit entity changes, request stats, retry payload, and notification intents together. After data commit, artifact/status preparation commits before external notification delivery. Callbacks receive a stable third-argument delivery ID and must deduplicate it. External delivery is at least once, not exactly once. All executors must use the store's supplied transaction client.
+The optional `PrismaExecutionStore` path reserves `(tenantId, type, requestKey)` with a unique constraint and uses Serializable transactions to commit entity changes, request stats, retry payload, and notification intents together. After data commit, artifact/status preparation commits before external notification delivery. Callbacks receive a `DeliveryContext` as the third argument and must deduplicate its stable `id`. External delivery is at least once, not exactly once. Even created/processing notifications are delivered after durable execution; callbacks cannot approve or cancel those data changes. Perform host authorization before calling the service. All executors must use the store's supplied transaction client.
 
 ## Preview and Durable Recovery
 
@@ -389,13 +398,19 @@ const request = await service.erase(verifiedSubjectId, tenantId, {
 const recovered = await service.retryCompletion(request.id, tenantId);
 ```
 
-Preview signatures bind subject, tenant, policy, row-scope fingerprints, and expiry. Default TTL is five minutes; provide a shared signing key across instances. Policy or data drift requires a fresh preview. Stable IDs allow verification even when a subject field is anonymized.
+Preview signatures bind subject, tenant, policy, row-scope fingerprints, and expiry. Default TTL is five minutes; provide a shared signing key of at least 32 bytes across instances. Policy or data drift requires a fresh preview. Stable IDs allow verification even when a subject field is anonymized.
 
-Duplicates reuse their stored request; a different payload under the same key is rejected. An already failed data execution is not rerun. Failed uploads retain the original bytes for recovery, then clear those bytes when upload completion is committed. The default DB retry-payload TTL is 24 hours per request type; configure `artifactRetryTtlMs` separately from remote file retention. Schedule the privileged `expirePendingArtifacts(limit)` worker to erase expired DB payloads. See the [P1 guide](docs/p1-migration.md) for schema migration, binding, recovery, and limits.
+Every durable `export` and `erase` requires a `requestKey`. Duplicate calls reuse their stored request; a different payload under the same tenant/type/key is rejected. The payload includes the actor and the entire preview: reuse the original preview and key for a network retry, and use a new approved key for a new plan. An already failed data execution is not rerun. Failed uploads retain the original bytes for recovery, then clear those bytes when upload completion is committed. The default DB retry-payload TTL is 24 hours per request type; configure `artifactRetryTtlMs` separately from remote file retention. Schedule the privileged `expirePendingArtifacts(limit)` worker to erase expired DB payloads. See the [P1 guide](docs/p1-migration.md) for schema migration, binding, recovery, and limits.
+
+A durable execution failure, including an invalid preview, can return a stored `failed` request instead of throwing. Inspect `state`, `failureReason`, `stats.lifecycle`, and `stats.verification`; an HTTP success response alone does not establish erasure success. Failed erasure evidence may be preserved without changing the request to completed.
+
+## Paged Execution
+
+`PostgresJobStore` and the paged privacy handler use separate job IDs and private NDJSON/evidence chunks. Do not pass those IDs to `DataSubjectService.getArtifact()` or the ZIP download examples. This path supports independent models and commits each verified batch with its checkpoint. Later failure or cancellation preserves earlier commits; there is no whole-job rollback or cross-page snapshot. P1 signed previews do not authorize a paged job. See the [P2 execution guide](docs/p2-execution.md) for setup, authorization, retries, consistency, and repeated chunk cleanup.
 
 ## Failure and Completion Contract
 
-Inspect `request.stats.lifecycle` as well as `request.state`:
+Inspect `request.stats.lifecycle` as well as `request.state`. This table describes the immediate execution path:
 
 | Failure | Data outcome | Recovery direction |
 | --- | --- | --- |
@@ -405,7 +420,7 @@ Inspect `request.stats.lifecycle` as well as `request.state`:
 | Completion status persistence | `completed` | Reconcile stored request, data, and artifact |
 | Terminal outbox/audit callback | Completion state is preserved | Inspect `notificationFailures` and recover delivery only |
 
-The service persists an `unknown` checkpoint before data work. If request persistence becomes unavailable, `DataSubjectPersistenceError` exposes `requestId`, `tenantId`, `dataOutcome`, and `recovery: 'reconcile_request'` without the provider's raw error. Use that ID to reconcile before attempting another erase. Failure metadata contains error codes rather than raw database/provider messages.
+The immediate service persists an `unknown` checkpoint before data work. If request persistence becomes unavailable, `DataSubjectPersistenceError` exposes `requestId`, `tenantId`, `dataOutcome`, and `recovery: 'reconcile_request'` without the provider's raw error. Use that ID to reconcile before attempting another erase. Failure metadata contains error codes rather than raw database/provider messages.
 
 The immediate path exposes recovery guidance. The configured durable path implements `retryCompletion` for original artifact bytes and pending notifications. It never reruns failed entity work, and expired retry bytes cannot be regenerated by that API. See the [P1 guide](docs/p1-migration.md) for recovery semantics and the [P0 guide](docs/p0-migration.md) for the immediate-path contract.
 
@@ -423,12 +438,14 @@ The current implementation is intentionally small. A few things are important to
 ## Development
 
 ```bash
-npm test -- --runInBand
+npm ci
+DATA_SUBJECT_HTTP_FIXTURE=1 npm test -- --runInBand
 npm run lint
 npm run build
 npm run examples:check
 # With a disposable PostgreSQL DATABASE_URL:
 npm run test:compatibility
+npm run test:composition
 ```
 
 ## Examples
@@ -462,10 +479,12 @@ These timings include synthetic executor and instrumentation overhead. They do n
 
 GitHub Actions is configured with two workflows:
 
-- `CI`: validates and smoke-tests benchmarks on Node 20/22/24 and installs packed tarballs in two PostgreSQL-backed Nest/Prisma consumer profiles on Node 24.11.1
+- `CI`: runs lint, the full test suite including the local HTTP fixture, build, benchmark checks/smoke tests, and example checks on Node 20/22/24. Separate Node 24.11.1 PostgreSQL jobs exercise two packed Nest/Prisma profiles and the pinned Nestarc composition, including service-actor recovery.
 - `Release`: runs lint, unit tests, and the build before publishing to npm when a GitHub Release is published
 
 Release expectations:
+
+- select the next release version, update package/lockfile versions and this changelog, and complete the compatibility/example checks before tagging these unreleased breaking changes
 
 - configure npm Trusted Publisher for GitHub Actions:
   - organization/user: `nestarc`
@@ -480,7 +499,10 @@ Release expectations:
 
 - [P1 setup and migration](docs/p1-migration.md)
 - [Private artifacts and retention](docs/private-artifacts.md)
-
+- [P2 execution and recovery](docs/p2-execution.md)
+- [Transcend integration](docs/platform-integration.md)
+- [Pinned Nestarc composition](docs/nestarc-composition.md)
+- [Support scope proposal](docs/p2-support-proposal.md)
 - [P0 migration guide](docs/p0-migration.md)
 - [Verified compatibility and PostgreSQL example](docs/compatibility.md)
 - [Authenticated tenant-safe Nest host example](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe)

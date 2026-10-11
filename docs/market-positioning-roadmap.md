@@ -44,14 +44,14 @@
 
 | 영역 | 현재 구현 | 다음 개선의 경계 |
 | --- | --- | --- |
-| 요청 저장 | [PrismaRequestStorage](../src/storage/prisma-request-storage.ts)와 메모리 저장소 | 신규 영구 저장소 개발 대신 테넌트 조회·원자적 상태 전환·중복 요청 계약 확장 |
-| 증빙과 감사 | [erase 증빙](../src/erasure-evidence.ts), 전후 행 수, SHA-256, 생성·처리·완료·실패 감사 콜백 | 필드 결과 검증, 정책 버전, DB 처리와 증빙·전달 상태 구분 |
-| 스키마 검사 | [lint CLI](../src/lint/lint.ts), [registry 검증](../src/registry-validation.ts) | 실행 정책과 검사 설정의 중복 해소, 변경 차이, nullability·관계 제약 확인 |
-| 실행 계획 | [EraseRunner](../src/erase-runner.ts)가 사전 조회 후 같은 호출에서 삭제 | 별도 미리보기 API, 계획의 유효기간과 실행 시 재검증 |
-| Prisma 실행 | [fromPrisma](../src/prisma/from-prisma.ts)의 선택적 tenant 조건, 필드 null 치환 | 명시적 테넌트 모드, 삭제 순서·필수 필드·관계 제약의 처리 범위 |
+| 요청 저장 | [PrismaRequestStorage](https://github.com/nestarc/data-subject/blob/92a05cb8c0aa3876e045893d777b935effbe9a69/src/storage/prisma-request-storage.ts)와 메모리 저장소 | 신규 영구 저장소 개발 대신 테넌트 조회·원자적 상태 전환·중복 요청 계약 확장 |
+| 증빙과 감사 | [erase 증빙](https://github.com/nestarc/data-subject/blob/92a05cb8c0aa3876e045893d777b935effbe9a69/src/erasure-evidence.ts), 전후 행 수, SHA-256, 생성·처리·완료·실패 감사 콜백 | 필드 결과 검증, 정책 버전, DB 처리와 증빙·전달 상태 구분 |
+| 스키마 검사 | [lint CLI](https://github.com/nestarc/data-subject/blob/92a05cb8c0aa3876e045893d777b935effbe9a69/src/lint/lint.ts), [registry 검증](https://github.com/nestarc/data-subject/blob/92a05cb8c0aa3876e045893d777b935effbe9a69/src/registry-validation.ts) | 실행 정책과 검사 설정의 중복 해소, 변경 차이, nullability·관계 제약 확인 |
+| 실행 계획 | [EraseRunner](https://github.com/nestarc/data-subject/blob/92a05cb8c0aa3876e045893d777b935effbe9a69/src/erase-runner.ts)가 사전 조회 후 같은 호출에서 삭제 | 별도 미리보기 API, 계획의 유효기간과 실행 시 재검증 |
+| Prisma 실행 | [fromPrisma](https://github.com/nestarc/data-subject/blob/92a05cb8c0aa3876e045893d777b935effbe9a69/src/prisma/from-prisma.ts)의 선택적 tenant 조건, 필드 null 치환 | 명시적 테넌트 모드, 삭제 순서·필수 필드·관계 제약의 처리 범위 |
 | 완료 검증 | 행 삭제 후 잔존 행 검증 | 필드 null·치환·보존 결과 검사. 등록되지 않은 데이터까지 검증했다는 표현 금지 |
-| 처리 상태 | [서비스](../src/data-subject.service.ts)의 즉시 실행과 transaction 콜백 | 동일 DB 안의 중복 방지, 상태 충돌 방지, 증빙 완료 재시도. 분산 재개는 별도 단계 |
-| 아티팩트 | [put/get 인터페이스](../src/storage/artifact-storage.interface.ts), 메모리 구현, 테넌트별 key | 비공개 영구 저장소 예제와 조회 권한·만료·정리 계약 |
+| 처리 상태 | [서비스](https://github.com/nestarc/data-subject/blob/92a05cb8c0aa3876e045893d777b935effbe9a69/src/data-subject.service.ts)의 즉시 실행과 transaction 콜백 | 동일 DB 안의 중복 방지, 상태 충돌 방지, 증빙 완료 재시도. 분산 재개는 별도 단계 |
+| 아티팩트 | [put/get 인터페이스](https://github.com/nestarc/data-subject/blob/92a05cb8c0aa3876e045893d777b935effbe9a69/src/storage/artifact-storage.interface.ts), 메모리 구현, 테넌트별 key | 비공개 영구 저장소 예제와 조회 권한·만료·정리 계약 |
 | 호환성 | [package.json](../package.json)의 NestJS 10·Prisma 5 | 실제 사용자가 요구하는 대표 조합부터 검증하고 지원 범위 확대 |
 
 **P0는 도입과 실행의 기본 신뢰를 확보한다.** P0 완료 전에는 파일럿에서 합성 데이터나 고객이 승인한 테스트 데이터만 사용한다. 현재 코드를 곧바로 안전한 운영 경로라고 홍보하지 않는다.

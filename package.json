@@ -1,7 +1,7 @@
 {
   "name": "@nestarc/data-subject",
   "version": "0.2.0",
-  "description": "DPA-ready GDPR/CCPA toolkit for NestJS + Prisma. Entity registry, export/erase lifecycle, legal retention, outbox fan-out.",
+  "description": "Tenant-scoped data export and verified erasure for NestJS + Prisma, with shared policies, signed previews, durable recovery, and paged jobs.",
   "license": "MIT",
   "author": "nestarc",
   "repository": "github:nestarc/data-subject",
@@ -35,7 +35,9 @@
     "docs/spec.md",
     "prisma",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
+    "docs/market-positioning-roadmap.md",
     "docs/compatibility.md",
     "docs/p0-migration.md",
     "docs/p1-migration.md",

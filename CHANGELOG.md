@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project currently tracks the shipped behavior of the repository rather than a long release history.
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes under Unreleased describe the current source build and are not part of the tagged 0.2.0 release; the package version has not yet been advanced.
 
 ## [Unreleased]
 
@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Relation lint accepts composite foreign-key detachment when one nullable component is cleared, and detects retained-child conflicts when a parent reference key changes through `onUpdate`.
 - The compiled CLI loads `.mjs` policy configurations with native ES module imports, including top-level await and paths containing spaces.
 - Private S3 download links use a fixed signing timestamp and are withheld if their validity expires while signing.
+- Benchmark reads and rollback snapshots independently copy Date and Decimal values so mutations cannot change expected results or saved rollback state.
+- The tenant-safe host forwards actor/subject-scoped durable request keys, preserves reconciliation details, and rejects unsupported idempotency claims before execution.
+- Nestarc completion workers record their verified `system` or `api_key` actor type instead of being logged as users, while preserving the original requester.
 
 ### P2
 
@@ -35,6 +38,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Tenant-safe policy helpers now return `{ definition, executor }` for the module's `definitions` option instead of `entities`; the example includes matching schema coverage and nullable-write checks.
+- Benchmarks use current shared policies and strict verification, exact total row counts, validated arguments, fresh fixtures, and assertions outside the measurement interval. Coverage includes signed previews, Prisma scalar replacements, and paged NDJSON/erasure.
+- Private artifact examples use the public API and document failed-evidence preservation, original-byte recovery, and separate S3/P1/P2 retention workflows.
+- README setup, public API, event, and validation guidance now covers the current source build. Package metadata describes concrete execution capabilities, and npm archives include this changelog and the implementation roadmap.
 - **Breaking:** export includes only `PolicySpec.exportFields`; omitted lists exclude the entity.
 - **Breaking:** Prisma executors require `tenantField` or explicit `singleTenantId`; the service validates matching scope and nonblank identifiers before execution.
 - **Breaking:** request lookup/update require tenant ID. Request identity fields cannot be patched.
@@ -44,6 +51,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Tenant-safe host routes for signed previews and owner-checked completion recovery, optional required-preview configuration, artifact-specific permissions, and content-type/SHA-256 verification before delivery.
+- `bench:check`, `bench:smoke`, and `examples:check`, CI coverage for benchmark/example checks, and example sources included in lint. The generated-client Nestarc example remains covered by the separate pinned PostgreSQL composition fixture.
 - Tenant-scoped artifact lookup, optional authenticated actor context, and a fail-closed Nest host example.
 - Real PostgreSQL tests using installed npm tarballs for Nest 10.4.22 / Prisma 5.22.0 and Nest 11.2.7 / Prisma 7.10.0 on Node 24.11.1.
 - [Migration guide](docs/p0-migration.md) and [exact compatibility matrix](docs/compatibility.md).
