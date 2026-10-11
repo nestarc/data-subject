@@ -430,12 +430,33 @@ npm run build
 npm run test:compatibility
 ```
 
+## Benchmarks
+
+```bash
+npm run bench:check
+npm run bench:smoke
+npm run bench -- --iterations 100 --warmup 10 --rows 1000 --batch-size 128
+```
+
+The benchmark measures in-memory execution using the current public APIs, shared policy definitions, and strict schema validation. `--rows` is the exact total target row count for each data scenario; ZIP export distributes that total across five entities, including any remainder. Fixtures also include other tenants and subjects to verify isolation. `--iterations` and `--rows` require positive integers, `--warmup` allows zero, and `--batch-size` accepts 1–1000.
+
+| Scenarios | Measured operation |
+| --- | --- |
+| A–B | Scoped executor read and five-field policy compilation |
+| C–F | Allowlisted ZIP export; verified row deletion, field deletion, and mixed erasure |
+| G–I | Signed preview, erasure with a prepared preview, and DateTime/Decimal/BigInt replacement verification |
+| P2 | Paged NDJSON export and mixed erasure through the actual handler, with local checkpoints |
+
+Each warmup and measured iteration starts with fresh fixtures. Seeding, registration, schema validation, and post-run assertions are outside the timer; execution includes the library's own verification, artifact creation, fixture reads/writes, and immediate erasure's local snapshot transaction. Reads and snapshots copy Date/Decimal values independently so in-place changes cannot alter the expected data or rollback state. Scenario H prepares its preview before timing. Afterward the benchmark checks actual rows, retained values, tenant/subject isolation, ZIP projection and hash, v2 evidence, and bounded P2 pages. Any failed check exits nonzero. Percentiles use the nearest-rank method over measured iterations only.
+
+These timings include synthetic executor and instrumentation overhead. They do not measure PostgreSQL queue locks, durable transactions, crash recovery, provider callbacks, or storage/network latency. P2 uses a local checkpoint loop and retains chunks and call traces in memory for verification, so it is not a streaming-memory benchmark. No relative speed ordering or timing threshold is asserted; compare repeated runs on the same Node version and hardware. For real database behavior use the [packed compatibility suite](docs/compatibility.md).
+
 ## CI and Release
 
 GitHub Actions is configured with two workflows:
 
-- `CI`: validates on Node 20/22/24 and installs packed tarballs in two PostgreSQL-backed Nest/Prisma consumer profiles on Node 24.11.1
-- `Release`: runs the same validation suite and then publishes to npm when a GitHub Release is published
+- `CI`: validates and smoke-tests benchmarks on Node 20/22/24 and installs packed tarballs in two PostgreSQL-backed Nest/Prisma consumer profiles on Node 24.11.1
+- `Release`: runs lint, unit tests, and the build before publishing to npm when a GitHub Release is published
 
 Release expectations:
 

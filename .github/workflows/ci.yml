@@ -49,6 +49,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Check benchmark types and behavior
+        run: npm run bench:check && npm run bench:smoke
+
   compatibility:
     name: Packed PostgreSQL (${{ matrix.profile }})
     runs-on: ubuntu-latest
