@@ -25,7 +25,22 @@ model DataSubjectRequest {
   artifactUrl   String?
   stats         Json?
   requestedBy   String?
+  execution     DataSubjectExecution?
 
   @@index([tenantId, subjectId])
   @@index([state, dueAt])
+}
+
+// Required for PrismaExecutionStore. Contains retry bytes, so apply the same
+// access control and explicit retention policy as the exported personal data.
+model DataSubjectExecution {
+  requestId      String @id
+  tenantId       String
+  type           String
+  idempotencyKey String
+  payloadHash    String
+  record         Json
+  request        DataSubjectRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, type, idempotencyKey])
 }

@@ -4,13 +4,14 @@
 
 Today the package ships:
 
-- a programmatic entity registry
+- a programmatic entity registry and a shared JSON policy definition for runtime/lint
 - a `DataSubjectService` for `export`, `erase`, and request lookup
 - a `DataSubjectModule.forRoot(...)` integration for NestJS
 - a lightweight Prisma adapter built on `findMany`, `deleteMany`, and `updateMany`
 - a `PrismaRequestStorage` adapter for persistent request records
 - in-memory request and artifact stores for tests and local development
-- erase evidence artifacts with pre/post scan stats and SHA-256 hashes
+- signed read-only erasure previews, stable-ID field verification, and v2 evidence
+- optional PostgreSQL idempotency, transactional execution records, and resumable artifact/notification delivery
 - a `data-subject lint` CLI for Prisma schema/policy checks
 - explicit export field allowlists and tenant-scoped request/artifact access
 - failure-stage metadata that distinguishes committed data from delivery failures
@@ -18,15 +19,15 @@ Today the package ships:
 
 ## Current Scope
 
-Package version: `0.2.0`. The working tree includes unreleased P0 contract changes; the migration notes below apply to this source build, not the published 0.2.0 tarball.
+Package version: `0.2.0`. The working tree includes unreleased P0/P1 contract changes; the migration notes below apply to this source build, not the published 0.2.0 tarball.
 
 This repository focuses on the execution core plus the minimum production trust layer. It does **not** currently ship:
 
 - decorators or automatic entity discovery
-- persistent artifact storage adapters beyond the in-memory implementation
+- a core cloud-storage dependency; a private S3 reference implementation is provided separately
 - direct Stripe, Intercom, analytics, or support-tool connectors
 - an admin or end-user portal
-- schema-aware Prisma field deletion beyond `null` assignment
+- automatic relation discovery/deletion, distributed transactions, or streaming exports
 
 If you need database-specific behavior, you can plug in your own `EntityExecutor`, `RequestStorage`, or `ArtifactStorage`.
 
@@ -44,7 +45,7 @@ Peer dependencies used by this package:
 - `rxjs`
 - `@prisma/client` if you use `fromPrisma(...)`
 
-See the [verified compatibility matrix](docs/compatibility.md) for exact tested versions and the [P0 migration guide](docs/p0-migration.md) for breaking API changes.
+See the [verified compatibility matrix](docs/compatibility.md), [P0 migration guide](docs/p0-migration.md), and [P1 setup/migration guide](docs/p1-migration.md) for tested versions and API changes.
 
 ## Quick Start
 
@@ -129,6 +130,8 @@ const artifactStorage = new InMemoryArtifactStorage(); // local/dev only; use pr
 })
 export class AppModule {}
 ```
+
+The quick start uses the immediate execution path. For durable idempotency and completion recovery, configure `PrismaExecutionStore` with transaction-bound delegates as shown in the [P1 guide](docs/p1-migration.md).
 
 For tests and local development, `InMemoryRequestStorage` and `InMemoryArtifactStorage` are still available. Do not use in-memory storage for production request history or evidence retention.
 
@@ -247,7 +250,9 @@ Current export artifact shape:
 Important details:
 
 - erase evidence artifacts intentionally exclude raw rows and field values
-- erase verification currently only fails on residual rows after `delete-row`
+- erasure requires a stable scalar row ID and tenant-scoped `selectByIds`; `fromPrisma` defaults to `id`
+- verification checks deleted rows, nullified fields, exact replacement values, and retained values after all entities execute
+- evidence v2 includes policy hash, actual strategy, field verification status, and sanitized failure information
 - field-level delete and anonymize operations keep rows in place by design
 - `subjectId` is not written into the default erase evidence artifact; it remains connected through the request record
 
@@ -260,7 +265,10 @@ Important details:
 - `slaDays`
 - `singleTenantId` (explicit single-tenant mode; omit for multi-tenant)
 - `strictLegalBasis`
-- `entities`
+- `entities` or shared `definitions`
+- `previewSigningKey`, `previewTtlMs`
+- `durableStore`, `artifactRetryTtlMs`
+- `allowUnverified` (explicit legacy-only compatibility)
 - `publishOutbox`
 - `publishAudit`
 - `runInTransaction`
@@ -296,7 +304,7 @@ The package includes a small Prisma schema linter:
 npx @nestarc/data-subject lint --schema prisma/schema.prisma --config data-subject.config.json
 ```
 
-The linter checks for PII-like field names, missing policy fields, missing subject fields, missing tenant metadata, invalid policies, and suppressions without reasons. It is a safety net, not a full data discovery tool.
+Use `definePolicy()` once and consume the same definitions in `Registry.registerDefinition()` and the lint config. Shared definitions enable strict scalar coverage and declared relation checks by default: new fields need a policy or an exclusion reason; required-field null writes, unsafe parent deletion, retained-child conflicts, missing dependencies, and cycles fail validation. The parser supports a documented Prisma subset; also run `prisma validate`. See the [shared-policy example](docs/p1-migration.md).
 
 ## Events and Hooks
 
@@ -355,7 +363,28 @@ new DataSubjectService({
 
 The hook wraps erase data reads, mutations, verification, and `erasure_requested`. All executors must resolve their delegates against the same transaction client, and the hook must resolve only after commit. The [packed PostgreSQL fixture](https://github.com/nestarc/data-subject/blob/main/test/compatibility/smoke.ts.in) demonstrates this with `AsyncLocalStorage`.
 
-Request state writes, artifact uploads, and terminal callbacks run outside that transaction. An external message sent during the callback cannot be rolled back by the database. Full atomic outbox delivery and durable resume remain future work.
+On the immediate path, request state writes, artifact uploads, and terminal callbacks run outside that transaction. An external message cannot be rolled back by the database.
+
+The optional `PrismaExecutionStore` path reserves `(tenantId, type, requestKey)` with a unique constraint and uses Serializable transactions to commit entity changes, request stats, retry payload, and notification intents together. After data commit, artifact/status preparation commits before external notification delivery. Callbacks receive a stable third-argument delivery ID and must deduplicate it. External delivery is at least once, not exactly once. All executors must use the store's supplied transaction client.
+
+## Preview and Durable Recovery
+
+```ts
+// service is configured with PrismaExecutionStore and transaction-bound executors.
+const preview = await service.previewErase(verifiedSubjectId, tenantId);
+// Host authorization/approval happens here. No data writes occurred during preview.
+const request = await service.erase(verifiedSubjectId, tenantId, {
+  requestedBy: actorId,
+  requestKey: hostRequestKey,
+  preview,
+});
+// After an artifact or notification failure; never invokes entity operations.
+const recovered = await service.retryCompletion(request.id, tenantId);
+```
+
+Preview signatures bind subject, tenant, policy, row-scope fingerprints, and expiry. Default TTL is five minutes; provide a shared signing key across instances. Policy or data drift requires a fresh preview. Stable IDs allow verification even when a subject field is anonymized.
+
+Duplicates reuse their stored request; a different payload under the same key is rejected. An already failed data execution is not rerun. Failed uploads retain the original bytes for recovery, then clear those bytes when upload completion is committed. The default DB retry-payload TTL is 24 hours per request type; configure `artifactRetryTtlMs` separately from remote file retention. Schedule the privileged `expirePendingArtifacts(limit)` worker to erase expired DB payloads. See the [P1 guide](docs/p1-migration.md) for schema migration, binding, recovery, and limits.
 
 ## Failure and Completion Contract
 
@@ -371,17 +400,18 @@ Inspect `request.stats.lifecycle` as well as `request.state`:
 
 The service persists an `unknown` checkpoint before data work. If request persistence becomes unavailable, `DataSubjectPersistenceError` exposes `requestId`, `tenantId`, `dataOutcome`, and `recovery: 'reconcile_request'` without the provider's raw error. Use that ID to reconcile before attempting another erase. Failure metadata contains error codes rather than raw database/provider messages.
 
-Recovery fields are guidance, not an automatic retry API. Artifact payload persistence, idempotency, and durable retries are P1 work. See the [migration guide](docs/p0-migration.md) for the full stage contract and host exception handling.
+The immediate path exposes recovery guidance. The configured durable path implements `retryCompletion` for original artifact bytes and pending notifications. It never reruns failed entity work, and expired retry bytes cannot be regenerated by that API. See the [P1 guide](docs/p1-migration.md) for recovery semantics and the [P0 guide](docs/p0-migration.md) for the immediate-path contract.
 
 ## Practical Limitations
 
 The current implementation is intentionally small. A few things are important to know up front:
 
 - `fromPrisma(...)` only depends on `findMany`, `deleteMany`, and `updateMany`
-- default Prisma field deletion writes `null`; it does not inspect schema nullability
+- default field deletion writes `null`; schema lint checks nullability before deployment, and does not query live database metadata during execution
 - request states include `validating`, but the built-in service currently transitions through `created -> processing -> completed|failed`
 - there is no built-in subject existence check before export or erase
-- no production cloud artifact adapter is bundled; use a private `ArtifactStorage` implementation for S3, R2, GCS, or equivalent storage
+- the [private S3 example](docs/private-artifacts.md) covers separate retention, authenticated downloads, signed URLs, and cleanup; real bucket/IAM compatibility must be validated in your environment
+- composite row IDs, arbitrary relational graphs, multi-database atomicity, and automatic legal-policy decisions are outside the supported scope
 
 ## Development
 
@@ -412,6 +442,9 @@ Release expectations:
 - stable versions such as `0.2.0` publish with npm dist-tag `latest`
 
 ## Related Docs
+
+- [P1 setup and migration](docs/p1-migration.md)
+- [Private artifacts and retention](docs/private-artifacts.md)
 
 - [P0 migration guide](docs/p0-migration.md)
 - [Verified compatibility and PostgreSQL example](docs/compatibility.md)

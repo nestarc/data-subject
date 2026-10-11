@@ -17,6 +17,25 @@ model Invoice {
   @@index([tenantId, subjectId])
 }
 
+model GraphAccount {
+  id        String @id
+  tenantId  String
+  subjectId String
+  email     String
+  sessions  GraphSession[]
+  @@index([tenantId, subjectId])
+}
+
+model GraphSession {
+  id        String @id
+  tenantId  String
+  subjectId String
+  accountId String
+  token     String?
+  account   GraphAccount @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  @@index([tenantId, subjectId])
+}
+
 model DataSubjectRequest {
   id            String @id
   tenantId      String
@@ -32,6 +51,18 @@ model DataSubjectRequest {
   artifactUrl   String?
   stats         Json?
   requestedBy   String?
+  execution     DataSubjectExecution?
   @@index([tenantId, subjectId])
   @@index([state, dueAt])
+}
+
+model DataSubjectExecution {
+  requestId      String @id
+  tenantId       String
+  type           String
+  idempotencyKey String
+  payloadHash    String
+  record         Json
+  request        DataSubjectRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  @@unique([tenantId, type, idempotencyKey])
 }

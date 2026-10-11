@@ -10,11 +10,16 @@ export const DataSubjectErrorCode = {
   RequestConflict: 'dsr_request_conflict',
   RequestNotFound: 'dsr_request_not_found',
   ArtifactWriteFailed: 'dsr_artifact_write_failed',
+  ArtifactExpired: 'dsr_artifact_expired',
   InvalidStateTransition: 'dsr_invalid_state_transition',
   EvidenceReportInvalid: 'dsr_evidence_report_invalid',
   InvalidInput: 'dsr_invalid_input',
   InvalidScope: 'dsr_invalid_scope',
   RequestPersistenceFailed: 'dsr_request_persistence_failed',
+  PlanMismatch: 'dsr_plan_mismatch',
+  PlanExpired: 'dsr_plan_expired',
+  VerificationUnavailable: 'dsr_verification_unavailable',
+  DurableExecutionRequired: 'dsr_durable_execution_required',
 } as const;
 
 export type DataSubjectErrorCode = (typeof DataSubjectErrorCode)[keyof typeof DataSubjectErrorCode];
@@ -29,11 +34,16 @@ const HTTP_STATUS: Record<DataSubjectErrorCode, number> = {
   dsr_request_conflict: 409,
   dsr_request_not_found: 404,
   dsr_artifact_write_failed: 500,
+  dsr_artifact_expired: 410,
   dsr_invalid_state_transition: 500,
   dsr_evidence_report_invalid: 500,
   dsr_invalid_input: 400,
   dsr_invalid_scope: 400,
   dsr_request_persistence_failed: 500,
+  dsr_plan_mismatch: 409,
+  dsr_plan_expired: 409,
+  dsr_verification_unavailable: 400,
+  dsr_durable_execution_required: 400,
 };
 
 export class DataSubjectError extends Error {

@@ -11,7 +11,9 @@ function makeExec(rows: Record<string, unknown>[]): EntityExecutor {
 
   return {
     scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
+    identityField: 'id',
     select: async () => [...state.rows],
+    selectByIds: async (ids) => state.rows.filter(row => ids.includes(row.id)),
     erase: async (_subjectId, _tenantId, plan: ErasePlan) => {
       const count = state.rows.length;
       if (plan.rowLevel === 'delete-row') {
@@ -130,7 +132,8 @@ describe('DataSubjectService', () => {
     const body = stored!.body.toString('utf8');
     expect(body).not.toContain('a@b.com');
     expect(JSON.parse(body)).toMatchObject({
-      schemaVersion: 'data-subject.erasure-evidence.v1',
+      schemaVersion: 'data-subject.erasure-evidence.v2',
+      verificationOverall: 'verified',
       requestId: request.id,
       tenantId: 'tenant_1',
       actions: [
@@ -202,7 +205,9 @@ describe('DataSubjectService', () => {
       },
       executor: {
         scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
+        identityField: 'id',
         select: async () => [{ id: 'u1' }],
+        selectByIds: async () => [{ id: 'u1' }],
         erase: async () => 0,
         anonymize: async () => 0,
       },
@@ -284,7 +289,9 @@ describe('DataSubjectService', () => {
       },
       executor: {
         scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
+        identityField: 'id',
         select: async () => [...state.rows],
+        selectByIds: async (ids) => state.rows.filter(row => ids.includes(row.id)),
         erase: async () => {
           const count = state.rows.length;
           state.rows = [];

@@ -1,247 +1,164 @@
 import { DataSubjectError, DataSubjectErrorCode } from './errors';
+import { captureErasureSnapshot, fingerprint, hashRegistryPolicy, type EntitySnapshot, type ErasurePlanSummary } from './erasure-plan';
 import type { Registry } from './registry';
-import type {
-  EntityPolicy,
-  ErasureEvidenceAction,
-  PolicyEntry,
-  RequestStats,
-  Strategy,
-} from './types';
+import { stableStringify } from './stable-json';
+import type { EntityVerification, ErasureEvidenceAction, RequestStats, Strategy } from './types';
 
 export interface EraseResult {
   stats: RequestStats;
   actions: ErasureEvidenceAction[];
 }
 
+/** Carries only policy names, counts and statuses, never selected row data. */
+export class ErasureVerificationError extends DataSubjectError {
+  constructor(readonly result: EraseResult) {
+    super(DataSubjectErrorCode.VerificationFailed, 'Erasure verification failed; inspect sanitized verification results');
+  }
+  get stats(): RequestStats { return this.result.stats; }
+  get actions(): ErasureEvidenceAction[] { return this.result.actions; }
+}
+
 export interface EraseRunOptions {
-  afterPreScan?: (
-    preScan: NonNullable<RequestStats['preScan']>,
-  ) => Promise<void>;
+  afterPreScan?: (preScan: NonNullable<RequestStats['preScan']>) => Promise<void>;
+  expectedPlan?: ErasurePlanSummary;
+  /** Explicit compatibility mode; its evidence is marked unverified. */
+  allowUnverified?: boolean;
 }
 
 export class EraseRunner {
   constructor(private readonly registry: Registry) {}
 
-  async run(
-    subjectId: string,
-    tenantId: string,
-    opts: EraseRunOptions = {},
-  ): Promise<EraseResult> {
-    const entries = this.registry.list();
-    const preScan: NonNullable<RequestStats['preScan']> = [];
-    const entities: RequestStats['entities'] = [];
-    const retained: NonNullable<RequestStats['retained']> = [];
-    const verificationResidual: NonNullable<RequestStats['verificationResidual']> =
-      [];
-    const postScan: NonNullable<RequestStats['postScan']> = [];
-    const actions: ErasureEvidenceAction[] = [];
+  async preview(subjectId: string, tenantId: string): Promise<ErasurePlanSummary> {
+    return (await captureErasureSnapshot(this.registry, subjectId, tenantId)).plan;
+  }
 
-    for (const entry of entries) {
-      const rowsBefore = await entry.executor.select(subjectId, tenantId);
-      preScan.push({
-        entityName: entry.policy.entityName,
-        count: rowsBefore.length,
-      });
+  async run(subjectId: string, tenantId: string, opts: EraseRunOptions = {}): Promise<EraseResult> {
+    const snapshot = await captureErasureSnapshot(this.registry, subjectId, tenantId);
+    if (opts.expectedPlan && stableStringify(snapshot.plan) !== stableStringify(opts.expectedPlan)) {
+      throw new DataSubjectError(DataSubjectErrorCode.PlanMismatch, 'The erasure scope or policy has changed; create a new preview');
     }
-
+    if (!opts.allowUnverified && snapshot.entities.some(entity => !entity.verificationAvailable)) {
+      throw new DataSubjectError(DataSubjectErrorCode.VerificationUnavailable, 'Every executor requires unique stable identities and selectByIds for erasure verification');
+    }
+    const preScan = snapshot.entities.map(({ entry, rows }) => ({ entityName: entry.policy.entityName, count: rows.length }));
     await opts.afterPreScan?.(preScan);
-
-    for (const entry of entries) {
-      const outcome = classify(entry.policy);
-      let affected = 0;
-
-      if (outcome.rowStrategy === 'delete') {
-        affected = await entry.executor.erase(
-          subjectId,
-          tenantId,
-          {
-            rowLevel: entry.policy.rowLevel,
-            deleteFields: outcome.deleteFields,
-          },
-        );
-      } else if (outcome.rowStrategy === 'anonymize') {
-        affected = await entry.executor.anonymize(
-          subjectId,
-          tenantId,
-          outcome.updateMap,
-        );
-      } else {
-        const rows = await entry.executor.select(subjectId, tenantId);
-        affected = rows.length;
+    if (hashRegistryPolicy(this.registry) !== snapshot.plan.policyHash) {
+      throw new DataSubjectError(DataSubjectErrorCode.PlanMismatch, 'Registry changed before execution; create a new preview');
+    }
+    const actions: ErasureEvidenceAction[] = [];
+    for (const entity of snapshot.entities) {
+      const { entry, outcome, rows } = entity;
+      let affected = rows.length;
+      if (outcome.effectiveRowStrategy === 'delete-row') {
+        affected = await entry.executor.erase(subjectId, tenantId, { rowLevel: 'delete-row', deleteFields: outcome.deleteFields });
+      } else if (outcome.effectiveRowStrategy === 'update-fields') {
+        if (outcome.anonymizedFields.length === 0 && outcome.retained.length === 0) {
+          affected = await entry.executor.erase(subjectId, tenantId, { rowLevel: 'delete-fields', deleteFields: outcome.deleteFields });
+        } else {
+          affected = await entry.executor.anonymize(subjectId, tenantId, outcome.updateMap);
+        }
       }
-
-      const rowsAfter = await entry.executor.select(subjectId, tenantId);
-      postScan.push({
-        entityName: entry.policy.entityName,
-        count: rowsAfter.length,
-      });
-
-      const retainedFields: NonNullable<
-        ErasureEvidenceAction['retainedFields']
-      > = [];
-
-      for (const item of outcome.retained) {
-        const retainedItem = {
-          entityName: entry.policy.entityName,
-          field: item.field,
-          legalBasis: item.legalBasis,
-          ...(item.until ? { until: item.until } : {}),
-          count: rowsAfter.length,
-        };
-        retained.push(retainedItem);
-        retainedFields.push({
-          field: item.field,
-          legalBasis: item.legalBasis,
-          ...(item.until ? { until: item.until } : {}),
-          count: rowsAfter.length,
-        });
-      }
-
-      if (
-        outcome.rowStrategy === 'delete' &&
-        entry.policy.rowLevel === 'delete-row' &&
-        rowsAfter.length > 0
-      ) {
-        verificationResidual.push({
-          entityName: entry.policy.entityName,
-          count: rowsAfter.length,
-        });
-      }
-
-      const action: ErasureEvidenceAction = {
+      actions.push({
         entityName: entry.policy.entityName,
         affected,
         strategy: outcome.summaryStrategy,
         rowLevel: entry.policy.rowLevel,
-      };
-      if (outcome.deleteFields.length > 0) {
-        action.deleteFields = [...outcome.deleteFields];
-      }
-      if (outcome.anonymizedFields.length > 0) {
-        action.anonymizedFields = [...outcome.anonymizedFields];
-      }
-      if (retainedFields.length > 0) {
-        action.retainedFields = retainedFields;
-      }
-      actions.push(action);
-
-      entities.push({
-        entityName: entry.policy.entityName,
-        affected,
-        strategy: outcome.summaryStrategy,
+        effectiveRowStrategy: outcome.effectiveRowStrategy,
+        ...(outcome.deleteFields.length ? { deleteFields: [...outcome.deleteFields] } : {}),
+        ...(outcome.anonymizedFields.length ? { anonymizedFields: [...outcome.anonymizedFields] } : {}),
+        ...(outcome.retained.length ? { retainedFields: outcome.retained.map(item => ({ ...item, count: rows.length })) } : {}),
+        verification: { status: 'unverified', checkedRows: 0, fields: [] },
       });
     }
-
-    if (verificationResidual.length > 0) {
-      throw new DataSubjectError(
-        DataSubjectErrorCode.VerificationFailed,
-        `residual rows: ${verificationResidual
-          .map((entry) => `${entry.entityName}(${entry.count})`)
-          .join(', ')}`,
-      );
+    // Verify after ALL writes: later deletes/cascades must not invalidate an earlier retain check.
+    const postScan: NonNullable<RequestStats['postScan']> = [];
+    const verificationResidual: NonNullable<RequestStats['verificationResidual']> = [];
+    for (const [index, entity] of snapshot.entities.entries()) {
+      const after = entity.verificationAvailable
+        ? await entity.entry.executor.selectByIds!(entity.ids, tenantId)
+        : await entity.entry.executor.select(subjectId, tenantId);
+      postScan.push({ entityName: entity.entry.policy.entityName, count: after.length });
+      const verification = verifyEntity(entity, after);
+      if (entity.outcome.effectiveRowStrategy === 'delete-row') {
+        const remaining = await entity.entry.executor.select(subjectId, tenantId);
+        if (remaining.length > 0) {
+          postScan[postScan.length - 1].count = Math.max(after.length, remaining.length);
+          verification.failedRows = Math.max(verification.failedRows, remaining.length);
+          verification.result.status = 'failed';
+          verification.result.fields = verification.result.fields.map(field => ({ ...field, status: 'failed' }));
+        }
+      }
+      actions[index].verification = verification.result;
+      if (verification.failedRows > 0) verificationResidual.push({ entityName: entity.entry.policy.entityName, count: verification.failedRows });
     }
-
-    return {
+    const result: EraseResult = {
       stats: {
-        entities,
-        retained,
+        policyHash: snapshot.plan.policyHash,
+        entities: actions.map(({ entityName, affected, strategy }) => ({ entityName, affected, strategy })),
+        retained: actions.flatMap(action => (action.retainedFields ?? []).map(field => ({ entityName: action.entityName, ...field }))),
+        verification: actions.map(({ entityName, verification }) => ({ entityName, ...verification! })),
         verificationResidual,
         preScan,
         postScan,
       },
       actions,
     };
+    if (verificationResidual.length) throw new ErasureVerificationError(result);
+    return result;
   }
 }
 
-interface Outcome {
-  rowStrategy: Strategy;
-  summaryStrategy: Exclude<RequestStats['entities'][number]['strategy'], 'export'>;
-  deleteFields: string[];
-  updateMap: Record<string, unknown>;
-  anonymizedFields: string[];
-  retained: Array<{ field: string; legalBasis: string; until?: string }>;
-}
-
-function classify(policy: EntityPolicy): Outcome {
-  const updateMap: Record<string, unknown> = {};
-  const deleteFields: string[] = [];
-  const anonymizedFields: string[] = [];
-  const retained: Outcome['retained'] = [];
-  const strategies = new Set<Strategy>();
-
-  for (const [field, entry] of Object.entries(policy.fields)) {
-    const normalized = normalize(entry);
-    strategies.add(normalized.strategy);
-
-    if (normalized.strategy === 'anonymize') {
-      updateMap[field] = normalized.replacement;
-      anonymizedFields.push(field);
-    }
-
-    if (normalized.strategy === 'delete') {
-      deleteFields.push(field);
-      updateMap[field] = null;
-    }
-
-    if (normalized.strategy === 'retain') {
-      retained.push({
-        field,
-        legalBasis: normalized.legalBasis,
-        ...(normalized.until ? { until: normalized.until } : {}),
-      });
-    }
-  }
-
-  const rowStrategy = chooseRowStrategy(strategies);
-
-  const summaryStrategy: Outcome['summaryStrategy'] =
-    strategies.size > 1 ? 'mixed' : rowStrategy;
-
-  return {
-    rowStrategy,
-    summaryStrategy,
-    deleteFields,
-    updateMap,
-    anonymizedFields,
-    retained,
+function verifyEntity(snapshot: EntitySnapshot, after: Record<string, unknown>[]): {
+  result: EntityVerification;
+  failedRows: number;
+} {
+  const { entry, outcome, rows } = snapshot;
+  const fields = Object.keys(entry.policy.fields).sort();
+  const strategy = (field: string): Strategy => {
+    const rule = entry.policy.fields[field];
+    return rule === 'delete' ? 'delete' : rule.strategy;
   };
-}
-
-function chooseRowStrategy(strategies: Set<Strategy>): Strategy {
-  if (strategies.size === 1 && strategies.has('delete')) {
-    return 'delete';
+  if (!snapshot.verificationAvailable) {
+    return { failedRows: 0, result: { status: 'unverified', checkedRows: 0, fields: fields.map(field => ({ field, strategy: strategy(field), checked: 0, status: 'unverified' })) } };
   }
-
-  if (strategies.size === 1 && strategies.has('retain')) {
-    return 'retain';
+  const afterByIdentity = new Map(after.map(row => [fingerprint(row[entry.executor.identityField!]), row]));
+  const failed = new Set<string>();
+  const failedFields = new Set<string>();
+  if (afterByIdentity.size !== after.length) {
+    failed.add('duplicate-result');
+    fields.forEach(field => failedFields.add(field));
   }
-
-  return 'anonymize';
-}
-
-function normalize(entry: PolicyEntry):
-  | { strategy: 'delete' }
-  | { strategy: 'anonymize'; replacement: unknown }
-  | { strategy: 'retain'; legalBasis: string; until?: string } {
-  if (entry === 'delete') {
-    return { strategy: 'delete' };
+  const originalIds = new Set(rows.map(row => row.identity));
+  for (const identity of afterByIdentity.keys()) if (!originalIds.has(identity)) {
+    failed.add(identity);
+    fields.forEach(field => failedFields.add(field));
   }
-
-  if (entry.strategy === 'anonymize') {
-    return {
-      strategy: 'anonymize',
-      replacement: entry.replacement,
-    };
+  for (const before of rows) {
+    const row = afterByIdentity.get(before.identity);
+    if (outcome.effectiveRowStrategy === 'delete-row') {
+      if (row) {
+        failed.add(before.identity);
+        fields.forEach(field => failedFields.add(field));
+      }
+    } else if (!row) {
+      failed.add(before.identity);
+      fields.forEach(field => failedFields.add(field));
+    } else {
+      for (const field of fields) {
+        const expected = strategy(field) === 'retain' ? before.fields[field] : fingerprint(outcome.updateMap[field]);
+        if (!Object.hasOwn(row, field) || fingerprint(row[field]) !== expected) {
+          failed.add(before.identity);
+          failedFields.add(field);
+        }
+      }
+    }
   }
-
-  if (entry.strategy === 'retain') {
-    return {
-      strategy: 'retain',
-      legalBasis: entry.legalBasis,
-      ...(entry.until ? { until: entry.until } : {}),
-    };
-  }
-
-  return { strategy: 'delete' };
+  return {
+    failedRows: failed.size,
+    result: {
+      status: failed.size > 0 ? 'failed' : 'verified',
+      checkedRows: rows.length,
+      fields: fields.map(field => ({ field, strategy: strategy(field), checked: rows.length, status: failedFields.has(field) ? 'failed' : 'verified' })),
+    },
+  };
 }

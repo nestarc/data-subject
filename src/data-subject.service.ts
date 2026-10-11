@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
 
 import { erasureEvidenceArtifactKey, exportArtifactKey, sha256Hex } from './artifacts';
-import { EraseRunner } from './erase-runner';
+import { DurableCoordinator } from './durable-coordinator';
+import type { DeliveryContext } from './durable-coordinator';
+import { hashRegistryPolicy } from './erasure-plan';
+import { PreviewSigner, type ErasurePreview } from './preview';
+import type { DurableExecutionStore } from './storage/durable-execution-store.interface';
+import { EraseRunner, ErasureVerificationError } from './erase-runner';
 import { buildErasureEvidenceArtifact } from './erasure-evidence';
 import { DataSubjectError, DataSubjectErrorCode, DataSubjectPersistenceError } from './errors';
 import { ExportRunner } from './export-runner';
@@ -20,7 +25,9 @@ import type {
 
 export interface RequestContext {
   /** The host must authenticate this actor and authorize the verified subject first. */
-  requestedBy: string;
+  requestedBy?: string;
+  requestKey?: string;
+  preview?: ErasurePreview;
 }
 
 export interface DataSubjectServiceDeps {
@@ -30,15 +37,28 @@ export interface DataSubjectServiceDeps {
   slaDays: number;
   /** Omit for multi-tenant mode. Every executor must declare a matching scope. */
   singleTenantId?: string;
+  durableStore?: DurableExecutionStore;
+  /** Retry-payload TTL from request creation; remote artifact retention is separate. */
+  artifactRetryTtlMs?: { export?: number; erase?: number };
+  previewSigningKey?: Buffer | string;
+  previewTtlMs?: number;
+  /** Legacy integrations only. Durable execution always requires verification. */
+  allowUnverified?: boolean;
   idFactory?: () => string;
   clock?: () => Date;
-  publishOutbox?: (type: string, payload: unknown) => Promise<void>;
-  publishAudit?: (event: string, data: Record<string, unknown>) => Promise<void>;
+  publishOutbox?: (type: string, payload: unknown, delivery?: DeliveryContext) => Promise<void>;
+  publishAudit?: (
+    event: string,
+    data: Record<string, unknown>,
+    delivery?: DeliveryContext,
+  ) => Promise<void>;
   /** Bind every executor to the transaction client; resolve only after commit. */
   runInTransaction?: <T>(work: () => Promise<T>) => Promise<T>;
 }
 
 export class DataSubjectService {
+  private readonly previewSigner: PreviewSigner;
+  private readonly durable?: DurableCoordinator;
   private readonly idFactory: () => string;
   private readonly clock: () => Date;
   private readonly publishOutbox: NonNullable<DataSubjectServiceDeps['publishOutbox']>;
@@ -46,6 +66,29 @@ export class DataSubjectService {
   private readonly runInTransaction: NonNullable<DataSubjectServiceDeps['runInTransaction']>;
 
   constructor(private readonly deps: DataSubjectServiceDeps) {
+    for (const ttl of Object.values(deps.artifactRetryTtlMs ?? {})) {
+      if (!Number.isSafeInteger(ttl) || ttl <= 0)
+        throw new DataSubjectError(
+          DataSubjectErrorCode.InvalidInput,
+          'artifact retry TTL must be a positive integer',
+        );
+    }
+    this.previewSigner = new PreviewSigner(deps.previewSigningKey);
+    if (deps.durableStore) {
+      if (deps.requestStorage !== deps.durableStore.requests || deps.allowUnverified) {
+        throw new DataSubjectError(
+          DataSubjectErrorCode.InvalidInput,
+          'durableStore requires its own request storage and verified executors',
+        );
+      }
+      this.durable = new DurableCoordinator(
+        deps,
+        deps.durableStore,
+        () => this.clock(),
+        (preview, subjectId, tenantId) =>
+          this.previewSigner.verify(preview, subjectId, tenantId, this.clock()),
+      );
+    }
     this.idFactory = deps.idFactory ?? (() => randomUUID());
     this.clock = deps.clock ?? (() => new Date());
     this.publishOutbox = deps.publishOutbox ?? (async () => {});
@@ -71,6 +114,59 @@ export class DataSubjectService {
     context?: RequestContext,
   ): Promise<DataSubjectRequest> {
     return this.execute('erase', subjectId, tenantId, context);
+  }
+
+  /** Read-only: no request insert, mutation, outbox, audit, or artifact write. */
+  async previewErase(
+    subjectId: string,
+    tenantId: string,
+    options: { ttlMs?: number } = {},
+  ): Promise<ErasurePreview> {
+    requireIdentifier(subjectId);
+    this.assertTenant(tenantId);
+    this.assertExecutors(tenantId);
+    const plan = await new EraseRunner(this.deps.registry).preview(subjectId, tenantId);
+    return this.previewSigner.issue(
+      plan,
+      subjectId,
+      tenantId,
+      this.clock(),
+      options.ttlMs ?? this.deps.previewTtlMs ?? 300_000,
+    );
+  }
+
+  /** Retries only committed artifacts and durable notifications, never entity work. */
+  async retryCompletion(id: string, tenantId: string): Promise<DataSubjectRequest> {
+    requireIdentifier(id);
+    this.assertTenant(tenantId);
+    if (!this.durable) throw new DataSubjectError(DataSubjectErrorCode.DurableExecutionRequired);
+    return this.durable.retryCompletion(id, tenantId);
+  }
+
+  /** Privileged bounded worker API. Schedule it to purge expired DB retry payloads. */
+  async expirePendingArtifacts(limit = 100): Promise<{
+    expired: number;
+    failures: Array<{ requestId: string; tenantId: string; code: string }>;
+  }> {
+    if (!this.durable || !this.deps.durableStore)
+      throw new DataSubjectError(DataSubjectErrorCode.DurableExecutionRequired);
+    const pending = await this.deps.durableStore.listExpiredArtifacts(this.clock(), limit);
+    const result = {
+      expired: 0,
+      failures: [] as Array<{ requestId: string; tenantId: string; code: string }>,
+    };
+    for (const { requestId, tenantId } of pending) {
+      try {
+        const request = await this.durable.retryCompletion(requestId, tenantId);
+        if (
+          request.stats?.lifecycle?.artifactFailure?.code === DataSubjectErrorCode.ArtifactExpired
+        )
+          result.expired += 1;
+      } catch (error) {
+        result.failures.push({ requestId, tenantId, code: failureCode(error) });
+      }
+    }
+    return result;
   }
 
   async getRequest(id: string, tenantId: string): Promise<DataSubjectRequest> {
@@ -111,8 +207,46 @@ export class DataSubjectService {
   ): Promise<DataSubjectRequest> {
     requireIdentifier(subjectId);
     this.assertTenant(tenantId);
-    if (context) requireIdentifier(context.requestedBy);
+    if (context?.requestedBy !== undefined) requireIdentifier(context.requestedBy);
+    if (context?.requestKey !== undefined) requireIdentifier(context.requestKey);
+    if (type === 'export' && context?.preview)
+      throw new DataSubjectError(
+        DataSubjectErrorCode.InvalidInput,
+        'erasure previews cannot authorize exports',
+      );
     this.assertExecutors(tenantId);
+    if (this.durable || context?.requestKey) {
+      if (!this.durable || !context?.requestKey)
+        throw new DataSubjectError(
+          DataSubjectErrorCode.DurableExecutionRequired,
+          'durable execution requires requestKey and durableStore',
+        );
+      const policyHash = hashRegistryPolicy(this.deps.registry);
+      const payloadHash = sha256Hex(
+        stableStringify({
+          type,
+          subjectId,
+          tenantId,
+          requestedBy: context.requestedBy ?? null,
+          policyHash,
+          preview: context.preview ?? null,
+        }),
+      );
+      return this.durable.execute(
+        this.buildRequest(type, subjectId, tenantId, context),
+        context,
+        payloadHash,
+        policyHash,
+      );
+    }
+    if (context?.preview) {
+      if (!this.deps.runInTransaction)
+        throw new DataSubjectError(
+          DataSubjectErrorCode.DurableExecutionRequired,
+          'preview execution requires a transaction-bound executor setup',
+        );
+      this.previewSigner.verify(context.preview, subjectId, tenantId, this.clock());
+    }
     const request = await this.createRequest(type, subjectId, tenantId, context);
     const lifecycle: RequestLifecycle = { dataOutcome: 'not_started' };
     let stats: RequestStats = { entities: [], lifecycle };
@@ -163,6 +297,10 @@ export class DataSubjectService {
       } else {
         const result = await this.runInTransaction(() =>
           new EraseRunner(this.deps.registry).run(subjectId, tenantId, {
+            expectedPlan: context?.preview
+              ? this.previewSigner.verify(context.preview, subjectId, tenantId, this.clock())
+              : undefined,
+            allowUnverified: this.deps.allowUnverified,
             afterPreScan: () =>
               this.publishOutbox('data_subject.erasure_requested', {
                 requestId: request.id,
@@ -198,7 +336,7 @@ export class DataSubjectService {
       artifactHash = sha256Hex(body);
       artifactUrl = await this.deps.artifactStorage.put(key, body, contentType);
       if (type === 'erase') {
-        stats.evidence = { schemaVersion: 'data-subject.evidence.v1', artifactHash, artifactUrl };
+        stats.evidence = { schemaVersion: 'data-subject.evidence.v2', artifactHash, artifactUrl };
       }
       stage = 'completion_persistence';
       await this.deps.requestStorage.update(request.id, tenantId, {
@@ -212,6 +350,7 @@ export class DataSubjectService {
       });
       state = 'completed';
     } catch (error) {
+      if (error instanceof ErasureVerificationError) stats = { ...error.stats, lifecycle };
       state = 'failed';
       failureReason =
         stage === 'artifact_write' ? DataSubjectErrorCode.ArtifactWriteFailed : failureCode(error);
@@ -318,6 +457,23 @@ export class DataSubjectService {
     tenantId: string,
     context?: RequestContext,
   ): Promise<DataSubjectRequest> {
+    const request = this.buildRequest(type, subjectId, tenantId, context);
+    try {
+      await this.deps.requestStorage.insert(request);
+    } catch (error) {
+      if (error instanceof DataSubjectError && error.code === DataSubjectErrorCode.RequestConflict)
+        throw error;
+      throw new DataSubjectPersistenceError(request.id, tenantId, 'not_started');
+    }
+    return request;
+  }
+
+  private buildRequest(
+    type: RequestType,
+    subjectId: string,
+    tenantId: string,
+    context?: RequestContext,
+  ): DataSubjectRequest {
     const now = this.clock();
     const request: DataSubjectRequest = {
       id: this.idFactory(),
@@ -336,13 +492,6 @@ export class DataSubjectService {
       requestedBy: context?.requestedBy ?? null,
     };
     requireIdentifier(request.id);
-    try {
-      await this.deps.requestStorage.insert(request);
-    } catch (error) {
-      if (error instanceof DataSubjectError && error.code === DataSubjectErrorCode.RequestConflict)
-        throw error;
-      throw new DataSubjectPersistenceError(request.id, tenantId, 'not_started');
-    }
     return request;
   }
 

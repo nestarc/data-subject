@@ -107,6 +107,7 @@ function makeRows(subjectId: string, tenantId: string, count: number): Row[] {
  */
 class InMemoryExecutor implements EntityExecutor {
   scope = { mode: 'multi-tenant' as const, tenantField: 'tenantId' };
+  identityField = 'id';
   rows: Row[] = [];
 
   seed(count: number, subjectId: string, tenantId: string): void {
@@ -117,6 +118,11 @@ class InMemoryExecutor implements EntityExecutor {
     return this.rows.filter(
       (row) => row.userId === subjectId && row.tenantId === tenantId,
     );
+  }
+
+  async selectByIds(ids: unknown[], tenantId: string): Promise<Row[]> {
+    const selected = new Set(ids);
+    return this.rows.filter(row => selected.has(row.id) && row.tenantId === tenantId);
   }
 
   async erase(subjectId: string, tenantId: string, plan: ErasePlan): Promise<number> {

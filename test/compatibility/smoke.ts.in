@@ -13,6 +13,7 @@ import {
   type DataSubjectModuleOptions,
 } from '@nestarc/data-subject';
 import { db } from './client';
+import { runP1, retryP1InFreshProcess, interruptP1Process } from './p1';
 
 type TransactionDelegates = Pick<typeof db, 'profile' | 'invoice' | 'dataSubjectRequest'>;
 const transactionContext = new AsyncLocalStorage<TransactionDelegates>();
@@ -52,6 +53,14 @@ async function createService(options: DataSubjectModuleOptions = baseOptions) {
 }
 
 async function main() {
+  if (process.argv[2] === '--retry-completion') {
+    await retryP1InFreshProcess(process.argv[3]);
+    return;
+  }
+  if (process.argv[2] === '--interrupt') {
+    await interruptP1Process(process.argv[3], process.argv[4]);
+    return;
+  }
   await seed('shared-subject');
   const { module, service } = await createService();
   try {
@@ -109,6 +118,7 @@ async function main() {
     assert.equal(await db.profile.count({ where: { tenantId: 'tenant-a', subjectId: 'callback-subject' } }), 0);
   } finally { await callback.module.close(); }
   console.log('PASS: packed consumer types, Nest module, export allowlist, tenant isolation, erase, retention, PostgreSQL rollback, completion delivery failure');
+  await runP1();
 }
 
 main().finally(() => db.$disconnect()).catch((error: unknown) => {

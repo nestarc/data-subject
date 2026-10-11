@@ -11,7 +11,8 @@ function mockDelegate(rows: Record<string, unknown>[] = [{ id: 'u1', userId: 's1
         async ({ where }: { where: Record<string, unknown> }) =>
           state.rows.filter((row) =>
             Object.entries(where).every(
-              ([key, value]) => (row as Record<string, unknown>)[key] === value,
+              ([key, value]) => value && typeof value === 'object' && 'in' in value
+                ? (value.in as unknown[]).includes(row[key]) : row[key] === value,
             ),
           ),
       ),
@@ -54,6 +55,44 @@ function mockDelegate(rows: Record<string, unknown>[] = [{ id: 'u1', userId: 's1
 }
 
 describe('fromPrisma', () => {
+  it('verifies stable identities within tenant scope after the subject key changes', async () => {
+    const mock = mockDelegate([
+      { id: 'u1', userId: null, tenantId: 't1', email: null },
+      { id: 'u2', userId: 's1', tenantId: 't2', email: 'other@example.com' },
+    ]);
+    const exec = fromPrisma({ delegate: mock.delegate, subjectField: 'userId', tenantField: 'tenantId' });
+    expect(exec.identityField).toBe('id');
+    expect(await exec.selectByIds!(['u1', 'u2'], 't1')).toEqual([mock.state.rows[0]]);
+    expect(mock.delegate.findMany).toHaveBeenCalledWith({ where: { tenantId: 't1', id: { in: ['u1', 'u2'] } } });
+  });
+
+  it('supports explicit stable identity fields and bounded lookup batches', async () => {
+    const mock = mockDelegate();
+    const exec = fromPrisma({ delegate: mock.delegate, subjectField: 'userId', singleTenantId: 't1', stableIdField: 'key' });
+    expect(exec.identityField).toBe('key');
+    await exec.selectByIds!(Array.from({ length: 1001 }, (_, index) => index), 't1');
+    expect(mock.delegate.findMany).toHaveBeenCalledTimes(2);
+    expect(mock.delegate.findMany).toHaveBeenLastCalledWith({ where: { key: { in: [1000] } } });
+  });
+
+  it('validates identity lookups and skips queries for an empty scope', async () => {
+    const mock = mockDelegate();
+    const exec = fromPrisma({ delegate: mock.delegate, subjectField: 'userId', singleTenantId: 't1' });
+    expect(await exec.selectByIds!([], 't1')).toEqual([]);
+    await expect(exec.selectByIds!([], 't2')).rejects.toMatchObject({ code: DataSubjectErrorCode.InvalidScope });
+    for (const value of [null, undefined, '', ' ', {}, Number.NaN, Infinity]) {
+      await expect(exec.selectByIds!([value], 't1')).rejects.toMatchObject({ code: DataSubjectErrorCode.InvalidInput });
+    }
+    expect(mock.delegate.findMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects blank identity fields or an identity which overwrites tenant filtering', () => {
+    const mock = mockDelegate();
+    for (const stableIdField of ['', ' ', 'tenantId']) {
+      expect(() => fromPrisma({ delegate: mock.delegate, subjectField: 'userId', tenantField: 'tenantId', stableIdField }))
+        .toThrow(DataSubjectErrorCode.InvalidScope);
+    }
+  });
   it('select queries by subjectField and tenantId', async () => {
     const mock = mockDelegate();
     const exec = fromPrisma({

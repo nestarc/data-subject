@@ -19,6 +19,8 @@ export interface EntityPolicy {
   rowLevel: RowLevel;
   fields: Record<string, PolicyEntry>;
   exportFields: string[];
+  stableIdField?: string;
+  dependsOn?: string[];
 }
 
 export interface ErasePlan {
@@ -33,6 +35,8 @@ export type TenantScope =
 export interface EntityExecutor {
   /** Required at runtime by DataSubjectService; custom executors must enforce this scope. */
   scope?: TenantScope;
+  identityField?: string;
+  selectByIds?(ids: unknown[], tenantId: string): Promise<Record<string, unknown>[]>;
   select(subjectId: string, tenantId: string): Promise<Record<string, unknown>[]>;
   erase(subjectId: string, tenantId: string, plan: ErasePlan): Promise<number>;
   anonymize(
@@ -68,6 +72,8 @@ export interface DataSubjectRequest {
 }
 
 export interface RequestStats {
+  policyHash?: string;
+  verification?: Array<{ entityName: string } & EntityVerification>;
   /** Stored in the existing stats JSON column; no schema migration is required. */
   lifecycle?: RequestLifecycle;
   entities: Array<{
@@ -86,7 +92,7 @@ export interface RequestStats {
   preScan?: Array<{ entityName: string; count: number }>;
   postScan?: Array<{ entityName: string; count: number }>;
   evidence?: {
-    schemaVersion: 'data-subject.evidence.v1';
+    schemaVersion: 'data-subject.evidence.v1' | 'data-subject.evidence.v2';
     artifactHash: string;
     artifactUrl: string;
   };
@@ -100,9 +106,15 @@ export type FailureStage =
   | 'completion_persistence';
 
 export interface RequestLifecycle {
+  artifactFailure?: { code: string; recovery: 'retry_artifact' | 'artifact_expired' };
   dataOutcome: 'not_started' | 'unknown' | 'completed';
   failureStage?: FailureStage;
-  recovery?: 'retry_request' | 'inspect_data' | 'retry_artifact' | 'reconcile_request';
+  recovery?:
+    | 'retry_request'
+    | 'inspect_data'
+    | 'retry_artifact'
+    | 'reconcile_request'
+    | 'artifact_expired';
   /** Callback delivery failures never undo completed data processing. */
   notificationFailures?: Array<{
     channel: 'outbox' | 'audit';
@@ -117,6 +129,8 @@ export interface ErasureEvidenceAction {
   strategy: Exclude<RequestEntityStrategy, 'export'>;
   affected: number;
   rowLevel: RowLevel;
+  effectiveRowStrategy?: 'delete-row' | 'update-fields' | 'retain';
+  verification?: EntityVerification;
   deleteFields?: string[];
   anonymizedFields?: string[];
   retainedFields?: Array<{
@@ -128,12 +142,15 @@ export interface ErasureEvidenceAction {
 }
 
 export interface ErasureEvidenceArtifact {
-  schemaVersion: 'data-subject.erasure-evidence.v1';
+  schemaVersion: 'data-subject.erasure-evidence.v1' | 'data-subject.erasure-evidence.v2';
+  policyHash?: string;
+  verificationOverall?: 'verified' | 'unverified' | 'failed';
+  failureStage?: FailureStage;
   requestId: string;
   tenantId: string;
   requestType: 'erase';
   generatedAt: string;
-  state: 'completed';
+  state: 'completed' | 'failed';
   preScan: Array<{ entityName: string; count: number }>;
   actions: ErasureEvidenceAction[];
   postScan: Array<{ entityName: string; count: number }>;
@@ -141,7 +158,22 @@ export interface ErasureEvidenceArtifact {
   artifactHashAlgorithm: 'sha256';
 }
 
+export interface EntityVerification {
+  status: 'verified' | 'unverified' | 'failed';
+  checkedRows: number;
+  fields: Array<{
+    field: string;
+    strategy: Strategy;
+    checked: number;
+    status: 'verified' | 'unverified' | 'failed';
+  }>;
+}
+
 export type DataSubjectOutboxEvent =
+  | {
+      type: 'data_subject.artifact_expired';
+      payload: { requestId: string; tenantId: string; requestType: RequestType };
+    }
   | {
       type: 'data_subject.request_created';
       payload: {

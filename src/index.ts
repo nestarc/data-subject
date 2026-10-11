@@ -33,7 +33,7 @@ export type { FromPrismaOptions, PrismaDelegate } from './prisma/from-prisma';
 export { exportArtifactKey, erasureEvidenceArtifactKey, sha256Hex } from './artifacts';
 export { buildErasureEvidenceArtifact } from './erasure-evidence';
 export { validateRegistry } from './registry-validation';
-export type { RegistryValidationReport } from './registry-validation';
+export type { RegistryValidationReport, RegistryValidationOptions } from './registry-validation';
 export { formatLintReport, lintPrismaSchema, parsePrismaSchema, shouldFailLint } from './lint';
 export type {
   DataSubjectLintCode,
@@ -44,3 +44,25 @@ export type {
   DataSubjectLintSeverity,
   DataSubjectLintSuppression,
 } from './lint';
+
+export { definePolicy, validateDefinition } from './policy-definition';
+export type { EntityDefinition } from './policy-definition';
+export type { ErasurePreview } from './preview';
+export { hashRegistryPolicy } from './erasure-plan';
+export type { ErasurePlanSummary, ErasurePlanEntity } from './erasure-plan';
+export { PrismaExecutionStore } from './storage/prisma-execution-store';
+export type {
+  DurableExecutionStore,
+  DurableArtifact,
+  ExecutionNotification,
+  ExecutionRecord,
+  ExecutionTransaction,
+} from './storage/durable-execution-store.interface';
+export type { DeliveryContext } from './durable-coordinator';
+
+export { ErasureVerificationError } from './erase-runner';
+export type {
+  PrismaExecutionStoreOptions,
+  PrismaExecutionClient,
+  PrismaExecutionTransactionClient,
+} from './storage/prisma-execution-store';

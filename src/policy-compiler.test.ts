@@ -2,6 +2,35 @@ import { DataSubjectError } from './errors';
 import { compilePolicy } from './policy-compiler';
 
 describe('compilePolicy', () => {
+  it('requires a stable identity for field writes while allowing row deletion', () => {
+    expect(() =>
+      compilePolicy({
+        entityName: 'User',
+        subjectField: 'userId',
+        stableIdField: 'id',
+        fields: { id: 'delete' },
+      }),
+    ).toThrow(/stableIdField/);
+    expect(
+      compilePolicy({
+        entityName: 'User',
+        subjectField: 'userId',
+        stableIdField: 'id',
+        rowLevel: 'delete-row',
+        fields: { id: 'delete' },
+      }).stableIdField,
+    ).toBe('id');
+    expect(() =>
+      compilePolicy({
+        entityName: 'User',
+        subjectField: 'userId',
+        stableIdField: 'id',
+        rowLevel: 'delete-row',
+        fields: { id: 'delete', email: { strategy: 'anonymize', replacement: 'x' } },
+      }),
+    ).toThrow(/stableIdField/);
+  });
+
   it('keeps export allowlists independent of erasure policy and copies them', () => {
     const exportFields = ['id', 'email'];
     const policy = compilePolicy({
@@ -15,21 +44,26 @@ describe('compilePolicy', () => {
   });
 
   it('defaults missing export allowlists to no exported fields', () => {
-    expect(compilePolicy({
-      entityName: 'User',
-      subjectField: 'userId',
-      fields: { passwordHash: 'delete' },
-    }).exportFields).toEqual([]);
+    expect(
+      compilePolicy({
+        entityName: 'User',
+        subjectField: 'userId',
+        fields: { passwordHash: 'delete' },
+      }).exportFields,
+    ).toEqual([]);
   });
 
   it.each([[['']], [['   ']], [[' email']], [['email', 'email']], [[1]], ['email']])(
-    'rejects malformed export allowlists %j', (exportFields) => {
-      expect(() => compilePolicy({
-        entityName: 'User',
-        subjectField: 'userId',
-        fields: { email: 'delete' },
-        exportFields: exportFields as unknown as string[],
-      })).toThrow(/exportFields/);
+    'rejects malformed export allowlists %j',
+    (exportFields) => {
+      expect(() =>
+        compilePolicy({
+          entityName: 'User',
+          subjectField: 'userId',
+          fields: { email: 'delete' },
+          exportFields: exportFields as unknown as string[],
+        }),
+      ).toThrow(/exportFields/);
     },
   );
 

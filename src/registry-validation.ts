@@ -1,5 +1,14 @@
 import type { Registry } from './registry';
 import type { DataSubjectLintFinding } from './lint/types';
+import { lintPrismaSchema } from './lint/lint';
+import type { RegisteredEntity } from './types';
+
+export interface RegistryValidationOptions {
+  requireTenantField?: boolean;
+  /** Schema validation requires every entity to use registerDefinition. */
+  schemaSource?: string;
+  strictCoverage?: boolean;
+}
 
 export interface RegistryValidationReport {
   ok: boolean;
@@ -8,11 +17,27 @@ export interface RegistryValidationReport {
 
 export function validateRegistry(
   registry: Registry,
-  opts: { requireTenantField?: boolean } = {},
+  opts: RegistryValidationOptions = {},
 ): RegistryValidationReport {
   const findings: DataSubjectLintFinding[] = [];
+  let entries: RegisteredEntity[];
+  try {
+    entries = registry.list();
+  } catch (error) {
+    return {
+      ok: false,
+      findings: [
+        {
+          severity: 'error',
+          code: 'dsr_lint_dependency_order',
+          model: '<registry>',
+          message: error instanceof Error ? error.message : 'Invalid entity dependency order',
+        },
+      ],
+    };
+  }
 
-  for (const entry of registry.list()) {
+  for (const entry of entries) {
     const { policy } = entry;
 
     if (!policy.subjectField.trim()) {
@@ -46,6 +71,28 @@ export function validateRegistry(
         message: `${policy.entityName} requires multi-tenant executor metadata with a distinct, nonblank tenantField`,
       });
     }
+  }
+
+  if (opts.schemaSource !== undefined) {
+    const definitions = registry.definitions();
+    for (const entry of entries) {
+      if (!definitions.some((definition) => definition.entityName === entry.policy.entityName)) {
+        findings.push({
+          severity: 'error',
+          code: 'dsr_lint_invalid_policy',
+          model: entry.policy.entityName,
+          message:
+            'Schema validation requires registerDefinition to share the runtime and lint policy',
+        });
+      }
+    }
+    findings.push(
+      ...lintPrismaSchema(opts.schemaSource, {
+        definitions,
+        strictCoverage: opts.strictCoverage ?? true,
+        requireTenantField: opts.requireTenantField,
+      }).findings,
+    );
   }
 
   return {

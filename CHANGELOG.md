@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### P1
+
+- Signed, read-only erasure previews with expiry and in-transaction policy/scope revalidation.
+- Shared serializable policy definitions, strict scalar coverage, required-field/null checks, declared relation/order/retention validation, and immutable registry snapshots.
+- **Breaking:** erasure requires stable scalar identity and `selectByIds` verification by default; explicit legacy compatibility records unverified results.
+- Evidence v2 records actual strategy, policy hash, field verification status, and sanitized verification failures.
+- Optional `PrismaExecutionStore` with tenant/type/key uniqueness, atomic data/request/outbox persistence, and original-byte completion recovery. Add the `DataSubjectExecution` model/migration before enabling it.
+- Stable notification delivery IDs, bounded serialization retries, retry-payload expiration, and an administrative expiry worker.
+- Private S3 storage reference with distinct export/evidence retention, access checks, presigning, immutable retries, and cleanup.
+- Packed PostgreSQL consumer tests for concurrency, rollback, commit interruption, and fresh-process recovery on Prisma 5 and 7.
+
 ### Changed
 
 - **Breaking:** export includes only `PolicySpec.exportFields`; omitted lists exclude the entity.

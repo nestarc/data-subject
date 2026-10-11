@@ -1,0 +1,435 @@
+import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import {
+  DataSubjectService,
+  PrismaExecutionStore,
+  Registry,
+  definePolicy,
+  fromPrisma,
+  lintPrismaSchema,
+  type ArtifactStorage,
+  type DataSubjectServiceDeps,
+  type EntityExecutor,
+  type PolicySpec,
+  type EntityDefinition,
+} from '@nestarc/data-subject';
+import { db } from './client';
+
+type TransactionDelegates = Pick<typeof db, 'profile' | 'invoice' | 'graphAccount' | 'graphSession'>;
+const transactionContext = new AsyncLocalStorage<TransactionDelegates>();
+function delegate<K extends keyof TransactionDelegates>(name: K): TransactionDelegates[K] {
+  return new Proxy(db[name], {
+    get(_target, key) {
+      const target = (transactionContext.getStore() ?? db)[name];
+      const value = Reflect.get(target, key);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+// The fixture persists bytes across child processes, independently of request metadata.
+// Production applications should use the documented private object storage adapter.
+class FileArtifacts implements ArtifactStorage {
+  failWrites = false;
+  writeCount = 0;
+  private filename(key: string) {
+    return path.join(process.cwd(), 'artifacts', createHash('sha256').update(key).digest('hex'));
+  }
+  async put(key: string, body: Buffer, contentType: string): Promise<string> {
+    this.writeCount++;
+    if (this.failWrites) throw new Error('injected object store outage');
+    const filename = this.filename(key);
+    mkdirSync(path.dirname(filename), { recursive: true });
+    writeFileSync(filename, body);
+    writeFileSync(`${filename}.type`, contentType);
+    return `private-test://${key}`;
+  }
+  async get(key: string) {
+    const filename = this.filename(key);
+    if (!existsSync(filename)) return null;
+    return { body: readFileSync(filename), contentType: readFileSync(`${filename}.type`, 'utf8') };
+  }
+}
+
+const profilePolicy: PolicySpec = {
+  entityName: 'Profile', subjectField: 'subjectId', stableIdField: 'id', rowLevel: 'delete-row',
+  fields: { email: 'delete' }, exportFields: ['id', 'email'],
+};
+const invoicePolicy: PolicySpec = {
+  entityName: 'Invoice', subjectField: 'subjectId', stableIdField: 'id',
+  fields: { email: 'delete', total: { strategy: 'retain', legalBasis: 'GDPR Art. 17(3)(b)' } },
+  exportFields: ['id', 'email', 'total'],
+};
+
+function makeService(options: {
+  artifacts?: FileArtifacts;
+  profile?: EntityExecutor;
+  invoice?: EntityExecutor;
+  policies?: PolicySpec[];
+  registrations?: Array<{ policy: PolicySpec; executor: EntityExecutor }>;
+  clock?: () => Date;
+  publishOutbox?: DataSubjectServiceDeps['publishOutbox'];
+  forbidData?: boolean;
+  durable?: boolean;
+  artifactRetryTtlMs?: { export?: number; erase?: number };
+} = {}) {
+  const store = new PrismaExecutionStore({
+    client: db,
+    bindTransaction: (tx, work) => transactionContext.run(tx, work),
+    transactionOptions: { maxWait: 20000, timeout: 20000 },
+    executionSchemaName: new URL(process.env.DATABASE_URL!).searchParams.get('schema')!,
+  });
+  const registry = new Registry();
+  const profile = options.profile ?? fromPrisma({ delegate: delegate('profile'), subjectField: 'subjectId', tenantField: 'tenantId', stableIdField: 'id' });
+  const invoice = options.invoice ?? fromPrisma({ delegate: delegate('invoice'), subjectField: 'subjectId', tenantField: 'tenantId', stableIdField: 'id' });
+  const registrations = options.registrations ?? (options.policies ?? [profilePolicy, invoicePolicy]).map((policy) => ({ policy, executor: policy.entityName === 'Profile' ? profile : invoice }));
+  for (const { policy, executor } of registrations) {
+    registry.register({ policy, executor: options.forbidData ? {
+      ...executor,
+      async select() { throw new Error('completion retry must not select business rows'); },
+      async erase() { throw new Error('completion retry must not erase twice'); },
+      async anonymize() { throw new Error('completion retry must not anonymize twice'); },
+    } : executor });
+  }
+  const artifacts = options.artifacts ?? new FileArtifacts();
+  const service = new DataSubjectService({
+    registry, requestStorage: store.requests, durableStore: options.durable === false ? undefined : store, artifactStorage: artifacts,
+    slaDays: 30, previewSigningKey: 'p1-integration-signing-secret-with-32-bytes',
+    clock: options.clock, publishOutbox: options.publishOutbox,
+    artifactRetryTtlMs: options.artifactRetryTtlMs,
+    runInTransaction: (work) => db.$transaction((tx) => transactionContext.run(tx, work)),
+  });
+  return { service, store, registry, artifacts };
+}
+
+async function seed(subjectId: string) {
+  await db.profile.createMany({ data: ['tenant-a', 'tenant-b'].map((tenantId) => ({ id: `${subjectId}-${tenantId}`, subjectId, tenantId, email: `${tenantId}@example.test`, passwordHash: 'private-password-hash', accessToken: 'private-access-token' })) });
+  await db.invoice.createMany({ data: ['tenant-a', 'tenant-b'].map((tenantId) => ({ id: `${subjectId}-${tenantId}`, subjectId, tenantId, email: `${tenantId}@example.test`, total: 42 })) });
+}
+
+function retryInFreshProcess(requestId: string) {
+  execFileSync(process.execPath, [path.join(__dirname, 'smoke.js'), '--retry-completion', requestId], { env: process.env, stdio: 'inherit' });
+}
+
+export async function retryP1InFreshProcess(requestId: string) {
+  const delivered: string[] = [];
+  const { service } = makeService({ forbidData: true, publishOutbox: async (_event, _payload, delivery) => {
+    assert.ok(delivery?.id, 'durable delivery has a stable deduplication id');
+    delivered.push(delivery.id);
+  } });
+  const completed = await service.retryCompletion(requestId, 'tenant-a');
+  assert.equal(completed.state, 'completed');
+  const artifact = await service.getArtifact(requestId, 'tenant-a');
+  assert.ok(artifact);
+  assert.equal(createHash('sha256').update(artifact.body).digest('hex'), completed.artifactHash);
+  writeFileSync(path.join(process.cwd(), `recovered-${requestId}.json`), JSON.stringify({ artifactHash: completed.artifactHash, delivered }));
+  console.log('PASS: fresh process completed durable work without calling a business executor');
+}
+
+export async function interruptP1Process(phase: string, subjectId: string) {
+  const invoice = fromPrisma({ delegate: delegate('invoice'), subjectField: 'subjectId', tenantField: 'tenantId', stableIdField: 'id' });
+  class InterruptedArtifacts extends FileArtifacts {
+    override async put(): Promise<string> { process.exit(77); }
+  }
+  const { service } = makeService(phase === 'after-commit'
+    ? { artifacts: new InterruptedArtifacts() }
+    : { invoice: { ...invoice, async anonymize() { process.exit(78); } } });
+  await service.erase(subjectId, 'tenant-a', { requestKey: `crash-${phase}` });
+  throw new Error('The child process should have exited at the injected interruption');
+}
+
+async function testProcessInterruption() {
+  for (const phase of ['before-commit', 'after-commit']) {
+    const subjectId = `p1-crash-${phase}`;
+    await seed(subjectId);
+    try {
+      execFileSync(process.execPath, [path.join(__dirname, 'smoke.js'), '--interrupt', phase, subjectId], { env: process.env, stdio: 'inherit' });
+      assert.fail('Expected abrupt child process exit');
+    } catch (error) {
+      assert.ok(typeof error === 'object' && error !== null && 'status' in error);
+      assert.equal(error.status, phase === 'after-commit' ? 77 : 78);
+    }
+    const row = await db.dataSubjectExecution.findUniqueOrThrow({ where: { tenantId_type_idempotencyKey: { tenantId: 'tenant-a', type: 'erase', idempotencyKey: `crash-${phase}` } } });
+    const execution = JSON.parse(JSON.stringify(row.record));
+    assert.equal(await db.profile.count({ where: { id: `${subjectId}-tenant-a` } }), phase === 'before-commit' ? 1 : 0);
+    if (phase === 'before-commit') {
+      assert.equal(execution.phase, 'pending');
+      assert.deepEqual(execution.notifications, [], 'outbox and business writes both rolled back');
+      assert.equal((await db.invoice.findUniqueOrThrow({ where: { id: `${subjectId}-tenant-a` } })).email, 'tenant-a@example.test');
+      const { service } = makeService();
+      const completed = await service.erase(subjectId, 'tenant-a', { requestKey: `crash-${phase}` });
+      assert.equal(completed.id, row.requestId);
+      assert.equal(completed.state, 'completed');
+    } else {
+      assert.equal(execution.phase, 'data_committed');
+      assert.ok(execution.notifications.length > 0, 'transaction committed its durable outbox');
+      const expected = Buffer.from(execution.artifact.bodyBase64, 'base64');
+      retryInFreshProcess(row.requestId);
+      const { service } = makeService();
+      assert.deepEqual((await service.getArtifact(row.requestId, 'tenant-a'))?.body, expected);
+    }
+  }
+  console.log('PASS: abrupt process exit before commit rolls back rows/outbox; exit after commit recovers original artifact without repeating deletion');
+}
+
+async function testPreview() {
+  await seed('p1-preview');
+  let now = new Date('2026-10-11T00:00:00.000Z');
+  const { service, artifacts } = makeService({ clock: () => now, durable: false });
+  const beforeRows = await db.profile.findMany({ orderBy: { id: 'asc' } });
+  const beforeRequests = await db.dataSubjectRequest.count();
+  const preview = await service.previewErase('p1-preview', 'tenant-a', { ttlMs: 1000 });
+  assert.deepEqual(await db.profile.findMany({ orderBy: { id: 'asc' } }), beforeRows);
+  assert.equal(await db.dataSubjectRequest.count(), beforeRequests);
+  assert.equal(artifacts.writeCount, 0);
+  assert.ok(!JSON.stringify(preview).includes('tenant-a@example.test'), 'preview omits row values');
+  assert.ok(!JSON.stringify(preview).includes('private-password-hash'));
+  now = new Date(now.getTime() + 1001);
+  await assert.rejects(service.erase('p1-preview', 'tenant-a', { preview }));
+  const renewed = await service.previewErase('p1-preview', 'tenant-a');
+  await assert.rejects(service.erase('p1-preview', 'tenant-b', { preview: renewed }));
+  await assert.rejects(service.erase('p1-preview', 'tenant-a', { preview: { ...renewed, signature: '0'.repeat(64) } }));
+  assert.equal(await db.dataSubjectRequest.count(), beforeRequests, 'invalid signature/expiry/scope rejects before request creation');
+  const changedPolicy = makeService({ durable: false, clock: () => now, policies: [profilePolicy, { ...invoicePolicy, fields: { ...invoicePolicy.fields, email: { strategy: 'anonymize', replacement: 'removed' } } }] });
+  const changedPolicyResult = await changedPolicy.service.erase('p1-preview', 'tenant-a', { preview: renewed });
+  assert.equal(changedPolicyResult.state, 'failed');
+  await db.invoice.update({ where: { id: 'p1-preview-tenant-a' }, data: { email: 'changed@example.test' } });
+  const result = await service.erase('p1-preview', 'tenant-a', { preview: renewed });
+  assert.equal(result.state, 'failed');
+  assert.equal(await db.profile.count({ where: { id: 'p1-preview-tenant-a' } }), 1, 'changed plan fails before any delete');
+  assert.equal((await db.invoice.findUniqueOrThrow({ where: { id: 'p1-preview-tenant-a' } })).email, 'changed@example.test');
+  assert.equal(artifacts.writeCount, 0);
+  const fresh = await service.previewErase('p1-preview', 'tenant-a');
+  assert.equal((await service.erase('p1-preview', 'tenant-a', { preview: fresh })).state, 'completed');
+  assert.equal(await db.profile.count({ where: { id: 'p1-preview-tenant-a' } }), 0);
+  assert.equal(await db.profile.count({ where: { id: 'p1-preview-tenant-b' } }), 1);
+  console.log('PASS: signed preview is write-free and rejects expired, tampered, cross-tenant, changed policy and changed data plans');
+}
+
+async function testFieldVerification() {
+  await seed('p1-no-op');
+  const invoice = fromPrisma({ delegate: delegate('invoice'), subjectField: 'subjectId', tenantField: 'tenantId', stableIdField: 'id' });
+  const noOp = makeService({ invoice: { ...invoice, async anonymize() { return 1; } } });
+  const failed = await noOp.service.erase('p1-no-op', 'tenant-a', { requestKey: 'no-op' });
+  assert.equal(failed.state, 'failed');
+  assert.equal(failed.stats?.lifecycle?.failureStage, 'data_execution');
+  assert.equal(await db.profile.count({ where: { id: 'p1-no-op-tenant-a' } }), 1, 'no-op verification rolls back earlier deletion');
+  assert.equal((await db.invoice.findUniqueOrThrow({ where: { id: 'p1-no-op-tenant-a' } })).email, 'tenant-a@example.test');
+
+  await seed('p1-retention');
+  const badRetention = makeService({ invoice: { ...invoice, async anonymize(subjectId, tenantId, replacements) {
+    const result = await delegate('invoice').updateMany({ where: { subjectId, tenantId }, data: { ...replacements, total: 0 } });
+    return result.count;
+  } } });
+  const retained = await badRetention.service.erase('p1-retention', 'tenant-a', { requestKey: 'retention-change' });
+  assert.equal(retained.state, 'failed');
+  assert.equal((await db.invoice.findUniqueOrThrow({ where: { id: 'p1-retention-tenant-a' } })).total, 42);
+
+  await seed('p1-subject-change');
+  const changedSubject = makeService({ policies: [{ ...invoicePolicy, fields: { ...invoicePolicy.fields, subjectId: { strategy: 'anonymize', replacement: 'redacted-subject' } } }] });
+  const complete = await changedSubject.service.erase('p1-subject-change', 'tenant-a', { requestKey: 'stable-id-verification' });
+  assert.equal(complete.state, 'completed');
+  const record = await db.invoice.findUniqueOrThrow({ where: { id: 'p1-subject-change-tenant-a' } });
+  assert.equal(record.subjectId, 'redacted-subject');
+  assert.equal(record.email, null);
+  assert.equal(record.total, 42);
+  assert.equal((await db.invoice.findUniqueOrThrow({ where: { id: 'p1-subject-change-tenant-b' } })).subjectId, 'p1-subject-change');
+  const evidence = await changedSubject.service.getArtifact(complete.id, 'tenant-a');
+  assert.ok(evidence);
+  assert.ok(!evidence.body.toString().includes('tenant-a@example.test'));
+  assert.ok(!evidence.body.toString().includes('p1-subject-change-tenant-a'), 'evidence omits row ids');
+  console.log('PASS: stable row identity detects no-op deletion and retention changes, verifies changed subject keys, and omits original values from evidence');
+}
+
+async function testDurableExecution() {
+  await seed('p1-concurrent');
+  let eraseCalls = 0;
+  const profile = fromPrisma({ delegate: delegate('profile'), subjectField: 'subjectId', tenantField: 'tenantId', stableIdField: 'id' });
+  const setup = makeService({ profile: { ...profile, async erase(subjectId, tenantId, plan) { eraseCalls++; return profile.erase(subjectId, tenantId, plan); } } });
+  const settled = await Promise.allSettled(Array.from({ length: 6 }, () => setup.service.erase('p1-concurrent', 'tenant-a', { requestKey: 'same-request' })));
+  const results = settled.map((result) => {
+    if (result.status === 'rejected') throw result.reason;
+    return result.value;
+  });
+  assert.equal(new Set(results.map((request) => request.id)).size, 1);
+  assert.ok(results.every((request) => request.state === 'completed'));
+  assert.equal(eraseCalls, 1, 'concurrent same-key requests execute business deletion exactly once');
+  assert.equal(await db.dataSubjectExecution.count({ where: { tenantId: 'tenant-a', type: 'erase', idempotencyKey: 'same-request' } }), 1);
+  await assert.rejects(setup.service.erase('other-subject', 'tenant-a', { requestKey: 'same-request' }));
+  assert.equal(eraseCalls, 1);
+  const otherTenant = await setup.service.erase('p1-concurrent', 'tenant-b', { requestKey: 'same-request' });
+  assert.notEqual(otherTenant.id, results[0].id);
+  const exported = await setup.service.export('p1-concurrent', 'tenant-a', { requestKey: 'same-request' });
+  assert.notEqual(exported.id, results[0].id);
+  assert.equal(exported.state, 'completed');
+
+  await seed('p1-upload-recovery');
+  const artifacts = new FileArtifacts();
+  artifacts.failWrites = true;
+  const failedUpload = makeService({ artifacts });
+  const request = await failedUpload.service.erase('p1-upload-recovery', 'tenant-a', { requestKey: 'upload-recovery' });
+  assert.equal(request.state, 'failed');
+  assert.equal(request.stats?.lifecycle?.dataOutcome, 'completed');
+  assert.equal(request.stats?.lifecycle?.failureStage, 'artifact_write');
+  assert.equal(await db.profile.count({ where: { id: 'p1-upload-recovery-tenant-a' } }), 0);
+  const execution = await db.dataSubjectExecution.findUniqueOrThrow({ where: { requestId: request.id } });
+  const persisted = JSON.parse(JSON.stringify(execution.record));
+  assert.equal(persisted.phase, 'data_committed');
+  assert.ok(persisted.artifact.bodyBase64.length > 0);
+  const originalBytes = Buffer.from(persisted.artifact.bodyBase64, 'base64');
+  await assert.rejects(failedUpload.service.retryCompletion(request.id, 'tenant-b'));
+  retryInFreshProcess(request.id);
+  const recovered = await failedUpload.service.getRequest(request.id, 'tenant-a');
+  assert.equal(recovered.state, 'completed');
+  const artifact = await failedUpload.service.getArtifact(request.id, 'tenant-a');
+  assert.ok(artifact);
+  assert.deepEqual(artifact.body, originalBytes, 'fresh process uploads the original committed bytes');
+  assert.equal(recovered.artifactHash, persisted.artifact.hash);
+
+  await seed('p1-notification-recovery');
+  const observedCompletionStates: string[] = [];
+  const failedNotification = makeService({ publishOutbox: async (event, payload) => {
+    if (event === 'data_subject.request_completed') {
+      assert.ok(typeof payload === 'object' && payload !== null && 'requestId' in payload && typeof payload.requestId === 'string');
+      const committedRequest = await db.dataSubjectRequest.findUniqueOrThrow({ where: { id: payload.requestId } });
+      observedCompletionStates.push(committedRequest.state);
+      throw new Error('injected completion delivery outage');
+    }
+  } });
+  const notified = await failedNotification.service.erase('p1-notification-recovery', 'tenant-a', { requestKey: 'notification-recovery' });
+  assert.equal(notified.state, 'completed');
+  assert.deepEqual(observedCompletionStates, ['completed'], 'external completion callback observes committed state');
+  assert.ok(notified.stats?.lifecycle?.notificationFailures?.length);
+  const beforeNotificationRetry = await failedNotification.service.getArtifact(notified.id, 'tenant-a');
+  assert.ok(beforeNotificationRetry);
+  retryInFreshProcess(notified.id);
+  const afterNotificationRetry = await failedNotification.service.getArtifact(notified.id, 'tenant-a');
+  assert.deepEqual(afterNotificationRetry?.body, beforeNotificationRetry.body);
+  const retriedExecution = await db.dataSubjectExecution.findUniqueOrThrow({ where: { requestId: notified.id } });
+  const retriedRecord = JSON.parse(JSON.stringify(retriedExecution.record));
+  assert.ok(retriedRecord.notifications.every((entry: { delivered: boolean }) => entry.delivered));
+  console.log('PASS: PostgreSQL idempotency and payload conflicts, type/tenant isolation, original artifact recovery and notification recovery across fresh processes');
+}
+
+async function testDurableExpiry() {
+  await seed('p1-expired-upload');
+  let now = new Date('2026-10-11T00:00:00.000Z');
+  const artifacts = new FileArtifacts();
+  artifacts.failWrites = true;
+  const { service } = makeService({ artifacts, clock: () => now, artifactRetryTtlMs: { erase: 1000, export: 1000 } });
+  const failed = await service.erase('p1-expired-upload', 'tenant-a', { requestKey: 'expired-upload' });
+  assert.equal(failed.state, 'failed');
+  const attempts = artifacts.writeCount;
+  now = new Date(now.getTime() + 1001);
+  artifacts.failWrites = false;
+  for (let retry = 0; retry < 2; retry++) {
+    const expired = await service.retryCompletion(failed.id, 'tenant-a');
+    assert.equal(expired.state, 'failed');
+    assert.ok(expired.failureReason?.includes('expired'));
+    assert.equal(artifacts.writeCount, attempts, 'expired payload never starts another upload');
+  }
+  const row = await db.dataSubjectExecution.findUniqueOrThrow({ where: { requestId: failed.id } });
+  const record = JSON.parse(JSON.stringify(row.record));
+  assert.equal(record.artifact.bodyBase64, null, 'expired retry payload bytes are discarded from PostgreSQL');
+  assert.ok(record.artifact.discardedAt);
+  assert.equal(await db.profile.count({ where: { id: 'p1-expired-upload-tenant-a' } }), 0);
+  await seed('p1-expired-sweep');
+  artifacts.failWrites = true;
+  const pendingExport = await service.export('p1-expired-sweep', 'tenant-a', { requestKey: 'expired-sweep' });
+  assert.equal(pendingExport.state, 'failed');
+  const beforeSweep = artifacts.writeCount;
+  now = new Date(now.getTime() + 1001);
+  const swept = await service.expirePendingArtifacts();
+  assert.equal(swept.expired, 1);
+  assert.deepEqual(swept.failures, []);
+  assert.equal(artifacts.writeCount, beforeSweep, 'background sweep does not upload expired export bytes');
+  const sweptRow = await db.dataSubjectExecution.findUniqueOrThrow({ where: { requestId: pendingExport.id } });
+  assert.equal(JSON.parse(JSON.stringify(sweptRow.record)).artifact.bodyBase64, null);
+  assert.equal(await db.profile.count({ where: { id: 'p1-expired-sweep-tenant-a' } }), 1);
+  console.log('PASS: durable erase/export retry expiry and administrative sweep discard stored payload without new upload or deletion');
+}
+
+async function testRelationOrder() {
+  for (const tenantId of ['tenant-a', 'tenant-b']) {
+    await db.graphAccount.create({ data: { id: `graph-${tenantId}`, tenantId, subjectId: 'graph-subject', email: 'graph@example.test' } });
+    await db.graphSession.create({ data: { id: `session-${tenantId}`, tenantId, subjectId: 'graph-subject', accountId: `graph-${tenantId}`, token: 'session-token' } });
+  }
+  const parent = fromPrisma({ delegate: delegate('graphAccount'), subjectField: 'subjectId', tenantField: 'tenantId' });
+  const child = fromPrisma({ delegate: delegate('graphSession'), subjectField: 'subjectId', tenantField: 'tenantId' });
+  const { service, registry } = makeService({ registrations: [
+    { policy: { entityName: 'GraphAccount', subjectField: 'subjectId', rowLevel: 'delete-row', fields: { email: 'delete' } }, executor: parent },
+    { policy: { entityName: 'GraphSession', subjectField: 'subjectId', rowLevel: 'delete-row', fields: { token: 'delete' }, dependsOn: ['GraphAccount'] }, executor: child },
+  ] });
+  assert.deepEqual(registry.list().map((entry) => entry.policy.entityName), ['GraphSession', 'GraphAccount']);
+  const request = await service.erase('graph-subject', 'tenant-a', { requestKey: 'fk-child-before-parent' });
+  assert.equal(request.state, 'completed');
+  assert.equal(await db.graphAccount.count({ where: { tenantId: 'tenant-a' } }), 0);
+  assert.equal(await db.graphSession.count({ where: { tenantId: 'tenant-a' } }), 0);
+  assert.equal(await db.graphAccount.count({ where: { tenantId: 'tenant-b' } }), 1);
+  assert.equal(await db.graphSession.count({ where: { tenantId: 'tenant-b' } }), 1);
+  console.log('PASS: declared child-before-parent ordering satisfies actual PostgreSQL RESTRICT foreign keys and tenant isolation');
+}
+
+function testPolicyLint() {
+  const scalarSchema = `model Account {
+    id String @id
+    tenantId String
+    subjectId String
+    email String
+    passwordHash String
+  }`;
+  const definitions = definePolicy([{ entityName: 'Account', subjectField: 'subjectId', stableIdField: 'id', scope: { mode: 'multi-tenant', tenantField: 'tenantId' }, fields: { email: 'delete' }, exportFields: ['email'] }]);
+  const findings = lintPrismaSchema(scalarSchema, { definitions, strictCoverage: true });
+  assert.equal(findings.ok, false);
+  assert.ok(findings.findings.some((finding) => finding.field === 'email'), 'cannot null a required field');
+  assert.ok(findings.findings.some((finding) => finding.field === 'passwordHash'), 'new non-pattern scalar field requires a policy or reason');
+  const shared = definePolicy([{ ...definitions[0], rowLevel: 'delete-row', ignoredFields: { passwordHash: 'Credential removed with the account row' } }]);
+  assert.equal(lintPrismaSchema(scalarSchema, { definitions: shared, strictCoverage: true }).ok, true);
+  const registry = new Registry();
+  registry.registerDefinition(shared[0], fromPrisma({ delegate: delegate('profile'), subjectField: 'subjectId', tenantField: 'tenantId' }));
+  assert.equal(registry.list()[0].policy.entityName, 'Account');
+  const relationSchema = `model Account {
+    id String @id
+    tenantId String
+    subjectId String
+    email String
+    invoices Bill[]
+  }
+  model Bill {
+    id String @id
+    tenantId String
+    subjectId String
+    accountId String
+    account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+    total Int
+  }`;
+  const related: EntityDefinition[] = [
+    { ...shared[0], ignoredFields: {}, relations: ['invoices'] },
+    { entityName: 'Bill', subjectField: 'subjectId', stableIdField: 'id', scope: { mode: 'multi-tenant', tenantField: 'tenantId' }, fields: { total: { strategy: 'retain', legalBasis: 'GDPR Art. 17(3)(b)' } }, ignoredFields: { accountId: 'Required reference to the retained invoice owner' }, relations: ['account'] },
+  ];
+  const conflict = lintPrismaSchema(relationSchema, { definitions: related });
+  assert.ok(conflict.findings.some((finding) => finding.code === 'dsr_lint_dependency_order'));
+  assert.ok(conflict.findings.some((finding) => finding.code === 'dsr_lint_retention_conflict'));
+  const cyclic: EntityDefinition[] = related.map((entry) => ({ ...entry, dependsOn: [entry.entityName === 'Account' ? 'Bill' : 'Account'] }));
+  assert.ok(lintPrismaSchema(relationSchema, { definitions: cyclic }).findings.some((finding) => finding.code === 'dsr_lint_dependency_cycle'));
+  const ordered = new Registry();
+  const executor = fromPrisma({ delegate: delegate('profile'), subjectField: 'subjectId', tenantField: 'tenantId' });
+  ordered.registerDefinition(related[0], executor);
+  ordered.registerDefinition({ ...related[1], dependsOn: ['Account'] }, executor);
+  assert.deepEqual(ordered.list().map((entry) => entry.policy.entityName), ['Bill', 'Account']);
+  console.log('PASS: packed shared definitions detect missing scalar policies, nonnullable deletion, undeclared order, dependency cycles and cascading retention conflicts');
+}
+
+export async function runP1() {
+  testPolicyLint();
+  await testPreview();
+  await testFieldVerification();
+  await testRelationOrder();
+  await testDurableExecution();
+  await testDurableExpiry();
+  await testProcessInterruption();
+}

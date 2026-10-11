@@ -10,10 +10,12 @@ function setup(
   overrides: Partial<DataSubjectServiceDeps> = {},
   executorOverrides: Partial<EntityExecutor> = {},
 ) {
-  const rows = [{ tenantId: 't1', subjectId: 's1', email: 'secret@example.com' }];
+  const rows = [{ id: 'row-1', tenantId: 't1', subjectId: 's1', email: 'secret@example.com' }];
   const executor: EntityExecutor = {
     scope: { mode: 'multi-tenant', tenantField: 'tenantId' },
+    identityField: 'id',
     select: jest.fn(async () => rows.map((row) => ({ ...row }))),
+    selectByIds: jest.fn(async (ids, tenantId) => rows.filter(row => ids.includes(row.id) && row.tenantId === tenantId).map(row => ({ ...row }))),
     erase: jest.fn(async () => {
       const count = rows.length;
       rows.splice(0);
@@ -129,6 +131,7 @@ describe('P0 lifecycle boundaries', () => {
           if (++selects > 1) throw new Error('verification read failed');
           return [...rows];
         },
+        selectByIds: async (ids) => rows.filter(row => ids.includes(row.id)),
         erase: async () => {
           rows = [];
           return 1;
@@ -359,12 +362,14 @@ describe('P0 service scope', () => {
   it('isolates data, request lookup and artifact reads for an identical subject in two tenants', async () => {
     const rows = [
       {
+        id: 'tenant-1-row',
         subjectId: 'same',
         tenantId: 't1',
         email: 'first@example.com',
         passwordHash: 'never-export',
       },
       {
+        id: 'tenant-2-row',
         subjectId: 'same',
         tenantId: 't2',
         email: 'second@example.com',
@@ -372,7 +377,8 @@ describe('P0 service scope', () => {
       },
     ];
     const matches = (row: Record<string, unknown>, where: Record<string, unknown>) =>
-      Object.entries(where).every(([key, value]) => row[key] === value);
+      Object.entries(where).every(([key, value]) => value && typeof value === 'object' && 'in' in value
+        ? (value.in as unknown[]).includes(row[key]) : row[key] === value);
     const executor = fromPrisma({
       subjectField: 'subjectId',
       tenantField: 'tenantId',
@@ -402,6 +408,7 @@ describe('P0 service scope', () => {
     await eraser.erase('same', 't1');
     expect(rows).toEqual([
       {
+        id: 'tenant-2-row',
         subjectId: 'same',
         tenantId: 't2',
         email: 'second@example.com',

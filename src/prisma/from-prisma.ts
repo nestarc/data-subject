@@ -20,10 +20,13 @@ export interface FromPrismaOptions {
   tenantField?: string;
   /** Explicit scope for databases which contain exactly one tenant. */
   singleTenantId?: string;
+  /** Immutable unique scalar key used to verify rows after subject-field updates. */
+  stableIdField?: string;
 }
 
 export function fromPrisma(opts: FromPrismaOptions): EntityExecutor {
   const { delegate, subjectField, tenantField, singleTenantId } = opts;
+  const identityField = opts.stableIdField ?? 'id';
   const hasTenantField = tenantField !== undefined;
   const hasSingleTenantId = singleTenantId !== undefined;
 
@@ -31,7 +34,7 @@ export function fromPrisma(opts: FromPrismaOptions): EntityExecutor {
     hasTenantField === hasSingleTenantId ||
     (hasTenantField && !isNonblank(tenantField)) ||
     (hasSingleTenantId && !isNonblank(singleTenantId)) ||
-    !isNonblank(subjectField) ||
+    !isNonblank(subjectField) || !isNonblank(identityField) || identityField === tenantField ||
     subjectField === tenantField
   ) {
     throw new DataSubjectError(
@@ -62,11 +65,28 @@ export function fromPrisma(opts: FromPrismaOptions): EntityExecutor {
   };
 
   return {
+    identityField,
     scope: hasTenantField
       ? { mode: 'multi-tenant', tenantField: tenantField! }
       : { mode: 'single-tenant', tenantId: singleTenantId! },
     async select(subjectId, tenantId) {
       return delegate.findMany({ where: whereFor(subjectId, tenantId) });
+    },
+    async selectByIds(ids, tenantId) {
+      // Validate scope without adding the mutable subject field to the lookup.
+      const scoped = whereFor('stable-identity-lookup', tenantId);
+      delete scoped[subjectField];
+      if (!ids.every(id => (typeof id === 'string' && id.trim().length > 0) ||
+        (typeof id === 'number' && Number.isFinite(id)) || typeof id === 'bigint')) {
+        throw new DataSubjectError(DataSubjectErrorCode.InvalidInput, 'Stable identities must be nonblank strings, finite numbers, or bigint values');
+      }
+      if (ids.length === 0) return [];
+      // Limit query parameters; callers still receive the complete verification scope.
+      const rows: Record<string, unknown>[] = [];
+      for (let offset = 0; offset < ids.length; offset += 1000) {
+        rows.push(...await delegate.findMany({ where: { ...scoped, [identityField]: { in: ids.slice(offset, offset + 1000) } } }));
+      }
+      return rows;
     },
     async erase(subjectId, tenantId, plan) {
       const where = whereFor(subjectId, tenantId);

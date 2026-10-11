@@ -37,7 +37,9 @@
     "README.md",
     "LICENSE",
     "docs/compatibility.md",
-    "docs/p0-migration.md"
+    "docs/p0-migration.md",
+    "docs/p1-migration.md",
+    "docs/private-artifacts.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
