@@ -7,45 +7,80 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
+  release-metadata:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release_meta.outputs.version }}
+      dist_tag: ${{ steps.release_meta.outputs.dist_tag }}
+    steps:
+      - name: Check out release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.x
+          check-latest: true
+          package-manager-cache: false
+
+      - name: Validate version, changelog, tag, and prerelease status
+        id: release_meta
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: node .github/scripts/release-metadata.cjs
+
+  validate:
+    name: Validate release commit
+    needs: release-metadata
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   publish-npm:
     name: Publish to npm
+    needs: [release-metadata, validate]
     runs-on: ubuntu-latest
     environment: npm
     timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v5
+      - name: Check out release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.x
+          check-latest: true
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
       - name: Set up npm for trusted publishing
         run: |
-          npm install -g npm@latest
+          npm install -g npm@12.2.0
           node --version
           npm --version
 
       - name: Install dependencies
         run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Test
-        run: npm test -- --runInBand
 
       - name: Build
         run: npm run build
@@ -53,36 +88,21 @@ jobs:
       - name: Preview publish contents
         run: npm pack --dry-run
 
-      - name: Validate release tag and choose npm dist-tag
-        id: release_meta
-        shell: bash
-        run: |
-          VERSION="$(node -p "require('./package.json').version")"
-          TAG_NAME="${{ github.event.release.tag_name }}"
-
-          if [[ "$TAG_NAME" != "v$VERSION" ]]; then
-            echo "Release tag $TAG_NAME does not match package.json version v$VERSION" >&2
-            exit 1
-          fi
-
-          if [[ "$VERSION" == *-* ]]; then
-            DIST_TAG="next"
-          else
-            DIST_TAG="latest"
-          fi
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
-
       - name: Publish package
-        run: npm publish --provenance --access public --tag "${{ steps.release_meta.outputs.dist_tag }}"
+        env:
+          DIST_TAG: ${{ needs.release-metadata.outputs.dist_tag }}
+        run: npm publish --provenance --access public --tag "$DIST_TAG"
 
       - name: Write workflow summary
+        env:
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+          DIST_TAG: ${{ needs.release-metadata.outputs.dist_tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           {
             echo "## npm release"
             echo ""
-            echo "- Version: \`${{ steps.release_meta.outputs.version }}\`"
-            echo "- npm dist-tag: \`${{ steps.release_meta.outputs.dist_tag }}\`"
-            echo "- Git tag: \`${{ github.event.release.tag_name }}\`"
+            printf -- '- Version: `%s`\n' "$VERSION"
+            printf -- '- npm dist-tag: `%s`\n' "$DIST_TAG"
+            printf -- '- Git tag: `%s`\n' "$RELEASE_TAG"
           } >> "$GITHUB_STEP_SUMMARY"

@@ -37,11 +37,10 @@ If you need database-specific behavior, you can plug in your own `EntityExecutor
 ## Installation
 
 ```bash
-# Once 0.3.0 is available in your registry:
 npm install @nestarc/data-subject@0.3.0
 ```
 
-To validate this checkout before publication, run `npm ci && npm run build && npm pack` and install the resulting `nestarc-data-subject-0.3.0.tgz` into your application. Updating repository metadata does not publish an npm release.
+To validate a local source build, run `npm ci && npm run build && npm pack` and install the resulting `nestarc-data-subject-0.3.0.tgz` into your application.
 
 Node.js 20 or newer is required; the chosen Prisma/Nest versions may impose stricter requirements. Peer dependencies used by this package:
 
@@ -480,19 +479,22 @@ These timings include synthetic executor and instrumentation overhead. They do n
 
 GitHub Actions is configured with two workflows:
 
-- `CI`: runs lint, the full test suite including the local HTTP fixture, build, benchmark checks/smoke tests, and example checks on Node 20/22/24. Separate Node 24.11.1 PostgreSQL jobs exercise two packed Nest/Prisma profiles and the pinned Nestarc composition, including service-actor recovery.
-- `Release`: runs lint, unit tests, and the build before publishing to npm when a GitHub Release is published
+- `CI`: runs release-metadata regression tests, lint, the full test suite including the local HTTP fixture, build, benchmark checks/smoke tests, and example checks on Node 20/22/24/26. Separate Node 24.11.1 PostgreSQL jobs exercise two packed Nest/Prisma profiles and the pinned Nestarc composition, including service-actor recovery. Node 20 remains a compatibility check for the declared engine range; use a supported Node LTS version for production.
+- `Release`: validates package/lockfile names and versions, the dated changelog entry, the release tag, and the GitHub prerelease flag, then calls the complete CI workflow for the release commit. Only after those checks succeed does it rebuild and publish with npm 12.2.0 on Node 24 LTS using OIDC. Only the publish job receives `id-token: write`; it uses no dependency cache.
+
+Both workflows pin checkout and setup-node to verified commit SHAs. Their version comments identify the upstream releases.
 
 Release expectations:
 
-- keep package/lockfile versions and the changelog in sync, and complete the compatibility/example checks before tagging a release
-
+- keep package/lockfile versions and the dated changelog entry in sync, and complete the compatibility/example checks before tagging a release
 - configure npm Trusted Publisher for GitHub Actions:
   - organization/user: `nestarc`
   - repository: `data-subject`
   - workflow filename: `release.yml`
   - environment: `npm`
+  - allowed action: direct `npm publish` (see the [npm Trusted Publisher settings](https://docs.npmjs.com/trusted-publishers/))
 - publish a GitHub Release from a tag that matches `v<package.json version>`
+- set the GitHub Release prerelease flag exactly when the package version has a prerelease suffix, such as `0.4.0-rc.1`
 - prerelease versions publish with npm dist-tag `next`
 - non-prerelease versions such as `0.3.0` publish with npm dist-tag `latest`
 

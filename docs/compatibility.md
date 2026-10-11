@@ -13,7 +13,7 @@ The representative combinations are pinned in `test/compatibility/*/package-lock
 
 Both profiles passed the full P0/P1/P2 suite locally on 2026-10-11 with a macOS arm64 Node process and PostgreSQL in an isolated Linux arm64 Docker container. The run used the stores' default bounded serialization retry settings, including the different SQLSTATE representations observed in Prisma 5 and Prisma 7. The GitHub Actions jobs below are configured for repeatable Linux validation; this local run does not claim that a remote CI run has completed.
 
-The baseline Node 20/22 unit/build CI remains; Node 24 is also checked. The packed PostgreSQL CI uses Node 24.11.1. Peer ranges allow Nest 10, Nest 11.2.7+, Prisma 5, and Prisma 7.10.0+ within those majors, but **the table lists the combinations actually exercised**. Cross-pairing these versions is not separately tested.
+The baseline Node 20/22 unit/build CI remains; Node 24 and 26 are also checked. The packed PostgreSQL CI uses Node 24.11.1. Peer ranges allow Nest 10, Nest 11.2.7+, Prisma 5, and Prisma 7.10.0+ within those majors, but **the table lists the combinations actually exercised**. Cross-pairing these versions is not separately tested.
 
 Nest 12, Prisma 6/8, other database engines, browser runtimes, native ESM consumer projects, and older Prisma 7 or Nest 11 releases are outside this verification matrix. Prisma 7 has its own Node version requirements and requires a driver adapter; consult [Prisma's system requirements](https://docs.prisma.io/docs/orm/reference/system-requirements) and [Prisma 7 upgrade guide](https://docs.prisma.io/docs/orm/v6/more/upgrades/to-v7) before selecting a different runtime. The package's broad Node engine range does not override dependency requirements.
 

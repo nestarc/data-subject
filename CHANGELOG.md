@@ -42,6 +42,8 @@ This pre-1.0 minor release includes breaking changes from 0.2.0 and the P0/P1/P2
 
 ### Changed
 
+- Update GitHub Actions to checkout 7.0.1 and setup-node 7.1.0, pinned to verified commit SHAs, and add Node 26 to the CI matrix while retaining the declared Node 20 compatibility check and pinned PostgreSQL profiles.
+- Require the complete reusable CI workflow before npm publication; validate release metadata before installing dependencies, scope OIDC permission to the publish job, and use npm 12.2.0 with safe environment-based tag handling. PostgreSQL fixture installers now share the restored npm cache, keyed by their lockfiles.
 - Tenant-safe policy helpers now return `{ definition, executor }` for the module's `definitions` option instead of `entities`; the example includes matching schema coverage and nullable-write checks.
 - Benchmarks use current shared policies and strict verification, exact total row counts, validated arguments, fresh fixtures, and assertions outside the measurement interval. Coverage includes signed previews, Prisma scalar replacements, and paged NDJSON/erasure.
 - Private artifact examples use the public API and document failed-evidence preservation, original-byte recovery, and separate S3/P1/P2 retention workflows.
