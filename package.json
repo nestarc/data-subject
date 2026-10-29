@@ -27,25 +27,10 @@
   },
   "files": [
     "dist",
-    "docs/code-review-src.md",
-    "docs/compliance.md",
-    "docs/data-subject-0.2.0-feature-proposal.md",
-    "docs/data-subject-0.2.0-spec.md",
-    "docs/prd.md",
-    "docs/spec.md",
     "prisma",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE",
-    "docs/market-positioning-roadmap.md",
-    "docs/compatibility.md",
-    "docs/p0-migration.md",
-    "docs/p1-migration.md",
-    "docs/private-artifacts.md",
-    "docs/p2-execution.md",
-    "docs/platform-integration.md",
-    "docs/nestarc-composition.md",
-    "docs/p2-support-proposal.md"
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

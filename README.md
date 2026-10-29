@@ -50,9 +50,9 @@ Node.js 20 or newer is required; the chosen Prisma/Nest versions may impose stri
 - `rxjs`
 - `@prisma/client` if you use `fromPrisma(...)`
 
-See the [verified compatibility matrix](docs/compatibility.md), [P0 migration guide](docs/p0-migration.md), and [P1 setup/migration guide](docs/p1-migration.md) for tested versions and API changes.
+See the [verified compatibility matrix](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/compatibility.md), [P0 migration guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p0-migration.md), and [P1 setup/migration guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p1-migration.md) for tested versions and API changes.
 
-The [P2 execution guide](docs/p2-execution.md) covers job migrations, batch boundaries, resumable NDJSON, cancellation, and retention. The [Transcend guide](docs/platform-integration.md) describes the optional erasure connector; [nestarc composition](docs/nestarc-composition.md) records the pinned integration and its transaction boundaries. These additions have synthetic verification; live provider accounts and customer workload validation remain separate.
+The [P2 execution guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p2-execution.md) covers job migrations, batch boundaries, resumable NDJSON, cancellation, and retention. The [Transcend guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/platform-integration.md) describes the optional erasure connector; [nestarc composition](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/nestarc-composition.md) records the pinned integration and its transaction boundaries. These additions have synthetic verification; live provider accounts and customer workload validation remain separate.
 
 ## Quick Start
 
@@ -118,7 +118,7 @@ const prisma = new PrismaClient();
 export class AppModule {}
 ```
 
-This quick start uses immediate execution without a transaction hook and does not promise rollback. Before exposing HTTP routes, connect authentication, authorization, subject verification, and private storage through the [tenant-safe host example](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe). For signed-preview execution, bind all delegates to a Serializable transaction; for durable idempotency and completion recovery, configure `PrismaExecutionStore` as shown in the [P1 guide](docs/p1-migration.md).
+This quick start uses immediate execution without a transaction hook and does not promise rollback. Before exposing HTTP routes, connect authentication, authorization, subject verification, and private storage through the [tenant-safe host example](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe). For signed-preview execution, bind all delegates to a Serializable transaction; for durable idempotency and completion recovery, configure `PrismaExecutionStore` as shown in the [P1 guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p1-migration.md).
 
 For tests and local development, `InMemoryRequestStorage` and `InMemoryArtifactStorage` are still available. Do not use in-memory storage for production request history or evidence retention.
 
@@ -314,7 +314,7 @@ module.exports = {
 
 Build `policy.ts` before running the CLI and adapt the compiled path to your application. The suppressions describe separate host responsibilities; they do not implement access control or cleanup. Config files may be `.json`, `.js`, `.cjs`, or `.mjs`; `.mjs` uses native ESM loading, including top-level await.
 
-Use `definePolicy()` once and consume the same definitions in `Registry.registerDefinition()` and the lint config. Shared definitions enable strict scalar coverage and declared relation checks by default: new fields need a policy or an exclusion reason; required-field null writes, unsafe parent deletion or reference-key updates, retained-child conflicts, missing dependencies, and cycles fail validation. The parser supports a documented Prisma subset; also run `prisma validate`. See the [shared-policy example](docs/p1-migration.md).
+Use `definePolicy()` once and consume the same definitions in `Registry.registerDefinition()` and the lint config. Shared definitions enable strict scalar coverage and declared relation checks by default: new fields need a policy or an exclusion reason; required-field null writes, unsafe parent deletion or reference-key updates, retained-child conflicts, missing dependencies, and cycles fail validation. The parser supports a documented Prisma subset; also run `prisma validate`. See the [shared-policy example](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p1-migration.md).
 
 ## Events and Hooks
 
@@ -400,13 +400,13 @@ const recovered = await service.retryCompletion(request.id, tenantId);
 
 Preview signatures bind subject, tenant, policy, row-scope fingerprints, and expiry. Default TTL is five minutes; provide a shared signing key of at least 32 bytes across instances. Policy or data drift requires a fresh preview. Stable IDs allow verification even when a subject field is anonymized.
 
-Every durable `export` and `erase` requires a `requestKey`. Duplicate calls reuse their stored request; a different payload under the same tenant/type/key is rejected. The payload includes the actor and the entire preview: reuse the original preview and key for a network retry, and use a new approved key for a new plan. An already failed data execution is not rerun. Failed uploads retain the original bytes for recovery, then clear those bytes when upload completion is committed. The default DB retry-payload TTL is 24 hours per request type; configure `artifactRetryTtlMs` separately from remote file retention. Schedule the privileged `expirePendingArtifacts(limit)` worker to erase expired DB payloads. See the [P1 guide](docs/p1-migration.md) for schema migration, binding, recovery, and limits.
+Every durable `export` and `erase` requires a `requestKey`. Duplicate calls reuse their stored request; a different payload under the same tenant/type/key is rejected. The payload includes the actor and the entire preview: reuse the original preview and key for a network retry, and use a new approved key for a new plan. An already failed data execution is not rerun. Failed uploads retain the original bytes for recovery, then clear those bytes when upload completion is committed. The default DB retry-payload TTL is 24 hours per request type; configure `artifactRetryTtlMs` separately from remote file retention. Schedule the privileged `expirePendingArtifacts(limit)` worker to erase expired DB payloads. See the [P1 guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p1-migration.md) for schema migration, binding, recovery, and limits.
 
 A durable execution failure, including an invalid preview, can return a stored `failed` request instead of throwing. Inspect `state`, `failureReason`, `stats.lifecycle`, and `stats.verification`; an HTTP success response alone does not establish erasure success. Failed erasure evidence may be preserved without changing the request to completed.
 
 ## Paged Execution
 
-`PostgresJobStore` and the paged privacy handler use separate job IDs and private NDJSON/evidence chunks. Do not pass those IDs to `DataSubjectService.getArtifact()` or the ZIP download examples. This path supports independent models and commits each verified batch with its checkpoint. Later failure or cancellation preserves earlier commits; there is no whole-job rollback or cross-page snapshot. P1 signed previews do not authorize a paged job. See the [P2 execution guide](docs/p2-execution.md) for setup, authorization, retries, consistency, and repeated chunk cleanup.
+`PostgresJobStore` and the paged privacy handler use separate job IDs and private NDJSON/evidence chunks. Do not pass those IDs to `DataSubjectService.getArtifact()` or the ZIP download examples. This path supports independent models and commits each verified batch with its checkpoint. Later failure or cancellation preserves earlier commits; there is no whole-job rollback or cross-page snapshot. P1 signed previews do not authorize a paged job. See the [P2 execution guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p2-execution.md) for setup, authorization, retries, consistency, and repeated chunk cleanup.
 
 ## Failure and Completion Contract
 
@@ -422,7 +422,7 @@ Inspect `request.stats.lifecycle` as well as `request.state`. This table describ
 
 The immediate service persists an `unknown` checkpoint before data work. If request persistence becomes unavailable, `DataSubjectPersistenceError` exposes `requestId`, `tenantId`, `dataOutcome`, and `recovery: 'reconcile_request'` without the provider's raw error. Use that ID to reconcile before attempting another erase. Failure metadata contains error codes rather than raw database/provider messages.
 
-The immediate path exposes recovery guidance. The configured durable path implements `retryCompletion` for original artifact bytes and pending notifications. It never reruns failed entity work, and expired retry bytes cannot be regenerated by that API. See the [P1 guide](docs/p1-migration.md) for recovery semantics and the [P0 guide](docs/p0-migration.md) for the immediate-path contract.
+The immediate path exposes recovery guidance. The configured durable path implements `retryCompletion` for original artifact bytes and pending notifications. It never reruns failed entity work, and expired retry bytes cannot be regenerated by that API. See the [P1 guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p1-migration.md) for recovery semantics and the [P0 guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p0-migration.md) for the immediate-path contract.
 
 ## Practical Limitations
 
@@ -432,7 +432,7 @@ The current implementation is intentionally small. A few things are important to
 - default field deletion writes `null`; schema lint checks nullability before deployment, and does not query live database metadata during execution
 - request states include `validating`, but the built-in service currently transitions through `created -> processing -> completed|failed`
 - there is no built-in subject existence check before export or erase
-- the [private S3 example](docs/private-artifacts.md) covers separate retention, authenticated downloads, signed URLs, and cleanup; real bucket/IAM compatibility must be validated in your environment
+- the [private S3 example](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/private-artifacts.md) covers separate retention, authenticated downloads, signed URLs, and cleanup; real bucket/IAM compatibility must be validated in your environment
 - composite row IDs, arbitrary relational graphs, multi-database atomicity, and automatic legal-policy decisions are outside the supported scope
 
 ## Development
@@ -452,7 +452,7 @@ npm run test:composition
 
 The [tenant-safe host](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe) uses shared policy definitions, signed previews, durable request keys, owner-checked completion recovery, and authenticated artifact delivery. Its policy helpers now return `{ definition, executor }` for the module's `definitions` option; they no longer belong in `entities`. Apply the matching schema checks and transaction wiring described in that example.
 
-`npm run examples:check` type-checks the tenant-safe and private-artifact examples and checks the S3 bridge syntax. Their runtime coverage is part of `npm test`. The [Nestarc composition](docs/nestarc-composition.md) needs generated Prisma 7 types and pinned optional packages, so its strict type check and real database validation run separately via `npm run test:composition`. The local examples check does not substitute for that database test or actual AWS validation.
+`npm run examples:check` type-checks the tenant-safe and private-artifact examples and checks the S3 bridge syntax. Their runtime coverage is part of `npm test`. The [Nestarc composition](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/nestarc-composition.md) needs generated Prisma 7 types and pinned optional packages, so its strict type check and real database validation run separately via `npm run test:composition`. The local examples check does not substitute for that database test or actual AWS validation.
 
 ## Benchmarks
 
@@ -473,7 +473,7 @@ The benchmark measures in-memory execution using the current public APIs, shared
 
 Each warmup and measured iteration starts with fresh fixtures. Seeding, registration, schema validation, and post-run assertions are outside the timer; execution includes the library's own verification, artifact creation, fixture reads/writes, and immediate erasure's local snapshot transaction. Reads and snapshots copy Date/Decimal values independently so in-place changes cannot alter the expected data or rollback state. Scenario H prepares its preview before timing. Afterward the benchmark checks actual rows, retained values, tenant/subject isolation, ZIP projection and hash, v2 evidence, and bounded P2 pages. Any failed check exits nonzero. Percentiles use the nearest-rank method over measured iterations only.
 
-These timings include synthetic executor and instrumentation overhead. They do not measure PostgreSQL queue locks, durable transactions, crash recovery, provider callbacks, or storage/network latency. P2 uses a local checkpoint loop and retains chunks and call traces in memory for verification, so it is not a streaming-memory benchmark. No relative speed ordering or timing threshold is asserted; compare repeated runs on the same Node version and hardware. For real database behavior use the [packed compatibility suite](docs/compatibility.md).
+These timings include synthetic executor and instrumentation overhead. They do not measure PostgreSQL queue locks, durable transactions, crash recovery, provider callbacks, or storage/network latency. P2 uses a local checkpoint loop and retains chunks and call traces in memory for verification, so it is not a streaming-memory benchmark. No relative speed ordering or timing threshold is asserted; compare repeated runs on the same Node version and hardware. For real database behavior use the [packed compatibility suite](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/compatibility.md).
 
 ## CI and Release
 
@@ -500,22 +500,24 @@ Release expectations:
 
 ## Related Docs
 
-- [P1 setup and migration](docs/p1-migration.md)
-- [Private artifacts and retention](docs/private-artifacts.md)
-- [P2 execution and recovery](docs/p2-execution.md)
-- [Transcend integration](docs/platform-integration.md)
-- [Pinned Nestarc composition](docs/nestarc-composition.md)
-- [Support scope proposal](docs/p2-support-proposal.md)
-- [P0 migration guide](docs/p0-migration.md)
-- [Verified compatibility and PostgreSQL example](docs/compatibility.md)
+`docs/` is kept locally and excluded from Git and npm packages. Detailed guide links below and throughout this README point to the last tracked documentation snapshot.
+
+- [P1 setup and migration](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p1-migration.md)
+- [Private artifacts and retention](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/private-artifacts.md)
+- [P2 execution and recovery](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p2-execution.md)
+- [Transcend integration](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/platform-integration.md)
+- [Pinned Nestarc composition](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/nestarc-composition.md)
+- [Support scope proposal](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p2-support-proposal.md)
+- [P0 migration guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p0-migration.md)
+- [Verified compatibility and PostgreSQL example](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/compatibility.md)
 - [Authenticated tenant-safe Nest host example](https://github.com/nestarc/data-subject/tree/main/examples/tenant-safe)
 
-- [Market positioning and improvement roadmap](docs/market-positioning-roadmap.md)
-- [docs/prd.md](docs/prd.md)
-- [docs/spec.md](docs/spec.md)
-- [docs/data-subject-0.2.0-feature-proposal.md](docs/data-subject-0.2.0-feature-proposal.md)
-- [docs/data-subject-0.2.0-spec.md](docs/data-subject-0.2.0-spec.md)
-- [docs/compliance.md](docs/compliance.md)
+- [Market positioning and improvement roadmap](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/market-positioning-roadmap.md)
+- [docs/prd.md](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/prd.md)
+- [docs/spec.md](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/spec.md)
+- [docs/data-subject-0.2.0-feature-proposal.md](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/data-subject-0.2.0-feature-proposal.md)
+- [docs/data-subject-0.2.0-spec.md](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/data-subject-0.2.0-spec.md)
+- [docs/compliance.md](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/compliance.md)
 - [CHANGELOG.md](CHANGELOG.md)
 
 ## License

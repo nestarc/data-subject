@@ -79,7 +79,7 @@ TenantSafePrivacyModule.forRoot({
 }, hostAccessService);
 ```
 
-`durableStore`는 [P1 설정](../../docs/p1-migration.md)에 따라 생성한 `PrismaExecutionStore`다. 모든 업무 delegate가 저장소의 같은 transaction client에 참여하도록 연결한다. 일반 경로는 `runInTransaction`에 Serializable transaction을 연결한다. 전역 Prisma client를 호출하면서 콜백만 감싸는 것은 rollback을 보장하지 않는다.
+`durableStore`는 [P1 설정](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p1-migration.md)에 따라 생성한 `PrismaExecutionStore`다. 모든 업무 delegate가 저장소의 같은 transaction client에 참여하도록 연결한다. 일반 경로는 `runInTransaction`에 Serializable transaction을 연결한다. 전역 Prisma client를 호출하면서 콜백만 감싸는 것은 rollback을 보장하지 않는다.
 
 영구 실행의 export/erase에는 ASCII 공백 없는 1~200자 `Idempotency-Key` 헤더 하나가 필요하다. 예를 들어 승인된 작업마다 만든 UUID를 사용한다. 이 값과 인증된 actor·subject를 함께 해시하고 tenant/type별 코어 중복 방지 범위에 전달한다. 같은 작업의 네트워크 재시도에는 **동일한 키와 원래 preview**를 재사용한다. 새 승인·새 계획은 새 키를 사용한다. 다른 actor는 같은 헤더로 기존 실행을 재사용하지 않는다. 영구 저장소 없는 모드에서 키를 보내면 중복 방지로 오인하지 않도록 400을 반환한다.
 
@@ -91,9 +91,9 @@ TenantSafePrivacyModule.forRoot({
 
 상태 DTO는 `lifecycle`, 필드별 `verification`, `evidenceVersion`을 제공하고 내부 `artifactUrl`을 노출하지 않는다. `artifactReady`는 완료된 업로드 기록에 대한 힌트이며, 파일 보존기간이 지났다면 다운로드는 404가 될 수 있다.
 
-다운로드는 완료 요청만 제공하고, 종류별 권한·content type·SHA-256을 확인한 뒤 `Cache-Control: no-store`와 attachment 헤더로 반환한다. 실패한 P1 삭제 증빙은 별도의 호스트 검토·권한·실패 상태 표시를 갖춘 경로로 제공한다. 증빙 파일이 존재해도 요청을 completed로 바꾸지 않는다. [비공개 S3 저장소 예제](../../docs/private-artifacts.md)는 별도 보존기간과 짧은 서명 링크를 설명한다.
+다운로드는 완료 요청만 제공하고, 종류별 권한·content type·SHA-256을 확인한 뒤 `Cache-Control: no-store`와 attachment 헤더로 반환한다. 실패한 P1 삭제 증빙은 별도의 호스트 검토·권한·실패 상태 표시를 갖춘 경로로 제공한다. 증빙 파일이 존재해도 요청을 completed로 바꾸지 않는다. [비공개 S3 저장소 예제](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/private-artifacts.md)는 별도 보존기간과 짧은 서명 링크를 설명한다.
 
-`listOverdue`, `expirePendingArtifacts`는 관리 작업이며 사용자 경로에 연결하지 않는다. [P2 큐·NDJSON](../../docs/p2-execution.md)은 별도 API이므로 이 예제의 request ID·ZIP 다운로드 경로와 혼용하지 않는다. 외부 플랫폼 연동은 [플랫폼 안내](../../docs/platform-integration.md)를 따른다.
+`listOverdue`, `expirePendingArtifacts`는 관리 작업이며 사용자 경로에 연결하지 않는다. [P2 큐·NDJSON](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p2-execution.md)은 별도 API이므로 이 예제의 request ID·ZIP 다운로드 경로와 혼용하지 않는다. 외부 플랫폼 연동은 [플랫폼 안내](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/platform-integration.md)를 따른다.
 
 ## 검증
 
@@ -104,4 +104,4 @@ npm run examples:check
 npm test -- --runInBand test/integration/host-boundary.test.ts test/integration/example-policy.test.ts
 ```
 
-로컬 테스트는 인증 경계, 정책/schema 일치, Nest 주입, preview·요청 키·재시도 연결, 소유권·다운로드 무결성을 검증한다. 외부 인증 공급자와 실제 transaction 연결은 호스트 환경에서 검증한다. 영구 실행과 [Nestarc 조합](../../docs/nestarc-composition.md)은 실제 PostgreSQL 소비자 fixture에서 별도로 검증한다.
+로컬 테스트는 인증 경계, 정책/schema 일치, Nest 주입, preview·요청 키·재시도 연결, 소유권·다운로드 무결성을 검증한다. 외부 인증 공급자와 실제 transaction 연결은 호스트 환경에서 검증한다. 영구 실행과 [Nestarc 조합](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/nestarc-composition.md)은 실제 PostgreSQL 소비자 fixture에서 별도로 검증한다.

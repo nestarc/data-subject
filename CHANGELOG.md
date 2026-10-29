@@ -6,9 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Keep `docs/` local and exclude it from Git and npm packages; preserve existing guide links through the last tracked documentation snapshot.
+
 ## [0.3.0] - 2026-10-11
 
-This pre-1.0 minor release includes breaking changes from 0.2.0 and the P0/P1/P2 improvements below. Before upgrading, follow the [P0 migration guide](docs/p0-migration.md) for export allowlists, tenant scope, and request-storage contracts, and the [P1 migration guide](docs/p1-migration.md) for stable-ID verification and optional durable execution. Apply the separate [P2 migrations](docs/p2-execution.md) only when enabling the job queue. The tenant-safe example's policy helpers move from `entities` to `definitions`.
+This pre-1.0 minor release includes breaking changes from 0.2.0 and the P0/P1/P2 improvements below. Before upgrading, follow the [P0 migration guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p0-migration.md) for export allowlists, tenant scope, and request-storage contracts, and the [P1 migration guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p1-migration.md) for stable-ID verification and optional durable execution. Apply the separate [P2 migrations](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p2-execution.md) only when enabling the job queue. The tenant-safe example's policy helpers move from `entities` to `definitions`.
 
 ### Fixed
 
@@ -61,7 +65,7 @@ This pre-1.0 minor release includes breaking changes from 0.2.0 and the P0/P1/P2
 - `bench:check`, `bench:smoke`, and `examples:check`, CI coverage for benchmark/example checks, and example sources included in lint. The generated-client Nestarc example remains covered by the separate pinned PostgreSQL composition fixture.
 - Tenant-scoped artifact lookup, optional authenticated actor context, and a fail-closed Nest host example.
 - Real PostgreSQL tests using installed npm tarballs for Nest 10.4.22 / Prisma 5.22.0 and Nest 11.2.7 / Prisma 7.10.0 on Node 24.11.1.
-- [Migration guide](docs/p0-migration.md) and [exact compatibility matrix](docs/compatibility.md).
+- [Migration guide](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/p0-migration.md) and [exact compatibility matrix](https://github.com/nestarc/data-subject/blob/43915e549442bce9bca56b3546b20f2a29b8b672/docs/compatibility.md).
 
 ## [0.2.0] - 2026-06-19
 
